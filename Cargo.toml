@@ -1,0 +1,20 @@
+[package]
+name = "envc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Profile based environment variable manager for bash"
+license = "MIT"
+
+[[bin]]
+name = "envc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

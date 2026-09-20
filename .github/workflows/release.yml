@@ -1,0 +1,145 @@
+name: release
+
+# Pushing a tag like v0.1.0 builds the Linux and macOS binaries and attaches
+# them to a GitHub release. Run it by hand from the Actions tab to rebuild an
+# existing tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: envc
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: unit tests
+        run: cargo test --locked
+
+      - name: end-to-end tests
+        run: |
+          cargo build --locked
+          bash tests/e2e.sh
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `apt` and `linker` are empty for native builds; keeping the keys
+          # present everywhere makes the `if:` conditions unambiguous.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            apt: ""
+            linker: ""
+
+          # Cross-compiled on the x86_64 runner; clap is pure Rust, so no
+          # target libraries are needed beyond the C toolchain and linker.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+
+          # Apple's SDK targets both architectures from an Apple silicon runner.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            apt: ""
+            linker: ""
+
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            apt: ""
+            linker: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install the cross linker
+        if: matrix.apt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          # CARGO_TARGET_<TARGET>_LINKER, derived from the target triple.
+          var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+          echo "$var=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          name="${BIN}-${version}-${target}"
+
+          mkdir -p dist
+          tar -czf "dist/${name}.tar.gz" -C "target/${target}/release" "${BIN}"
+
+          # A version-less copy so that /releases/latest/download/<name> works.
+          cp "dist/${name}.tar.gz" "dist/${BIN}-${target}.tar.gz"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${name}.tar.gz" > "SHA256SUMS-${target}.txt")
+          else
+            (cd dist && shasum -a 256 "${name}.tar.gz" > "SHA256SUMS-${target}.txt")
+          fi
+
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: merge checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat SHA256SUMS-*.txt | sort -k2 > SHA256SUMS
+          rm -f SHA256SUMS-*.txt
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
