@@ -218,13 +218,13 @@ if [ "$UPDATE_ONLY" = 1 ] && [ -n "$VERSION" ]; then
 fi
 
 if [ -n "$VERSION" ]; then
-    ASSET="${BIN}-${VERSION}-${TARGET}.tar.gz"
+    ASSET="${BIN}-${VERSION}-${TARGET}"
     URL="https://github.com/$REPO/releases/download/${VERSION}/${ASSET}"
     SUMS_URL="https://github.com/$REPO/releases/download/${VERSION}/SHA256SUMS"
 else
     # No tag known (no curl, or the API was unreachable): the version-less
     # asset alias published with every release still works.
-    ASSET="${BIN}-${TARGET}.tar.gz"
+    ASSET="${BIN}-${TARGET}"
     URL="https://github.com/$REPO/releases/latest/download/${ASSET}"
     SUMS_URL="https://github.com/$REPO/releases/latest/download/SHA256SUMS"
 fi
@@ -233,7 +233,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
 step "downloading $ASSET"
-try_download "$URL" "$TMP/$ASSET" \
+try_download "$URL" "$TMP/$BIN" \
     || die "could not download $URL
        check that a release named '$TAG' exists: https://github.com/$REPO/releases"
 
@@ -242,7 +242,7 @@ try_download "$URL" "$TMP/$ASSET" \
 
 if try_download "$SUMS_URL" "$TMP/SHA256SUMS"; then
     expected=$(awk -v f="$ASSET" '$2 == f {print $1}' "$TMP/SHA256SUMS")
-    actual=$(sha256_of "$TMP/$ASSET")
+    actual=$(sha256_of "$TMP/$BIN")
     if [ -z "$actual" ]; then
         warn "no sha256 tool found, skipping checksum verification"
     elif [ -z "$expected" ]; then
@@ -258,11 +258,14 @@ else
     warn "could not fetch SHA256SUMS, skipping checksum verification"
 fi
 
-# ---------------------------------------------------------------------------
-# install
-
-tar -xzf "$TMP/$ASSET" -C "$TMP" || die "could not extract $ASSET"
-[ -f "$TMP/$BIN" ] || die "the archive did not contain a '$BIN' binary"
+# A 404 page is served with a 200 by some proxies; make sure we got an actual
+# executable rather than HTML.
+magic=$(head -c 4 "$TMP/$BIN" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+case "$magic" in
+    7f454c46 | cffaedfe | cefaedfe | cafebabe) ;;
+    *) die "$ASSET did not download as an executable (magic: ${magic:-empty})
+       fetch it yourself: $URL" ;;
+esac
 chmod +x "$TMP/$BIN"
 
 step "installing to $BIN_DIR"

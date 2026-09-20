@@ -100,16 +100,19 @@ jobs:
           target="${{ matrix.target }}"
           name="${BIN}-${version}-${target}"
 
+          # The bare binary, no archive. GitHub does not preserve the execute
+          # bit on release assets, so the installer chmods what it downloads.
           mkdir -p dist
-          tar -czf "dist/${name}.tar.gz" -C "target/${target}/release" "${BIN}"
+          cp "target/${target}/release/${BIN}" "dist/${name}"
+          cp "target/${target}/release/${BIN}" "dist/${BIN}-${target}"
+          chmod 755 dist/*
 
-          # A version-less copy so that /releases/latest/download/<name> works.
-          cp "dist/${name}.tar.gz" "dist/${BIN}-${target}.tar.gz"
-
+          # Both names are listed: they are the same bytes, and the installer
+          # may have downloaded either one.
           if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "${name}.tar.gz" > "SHA256SUMS-${target}.txt")
+            (cd dist && sha256sum "${name}" "${BIN}-${target}" > "SHA256SUMS-${target}.txt")
           else
-            (cd dist && shasum -a 256 "${name}.tar.gz" > "SHA256SUMS-${target}.txt")
+            (cd dist && shasum -a 256 "${name}" "${BIN}-${target}" > "SHA256SUMS-${target}.txt")
           fi
 
           ls -l dist
