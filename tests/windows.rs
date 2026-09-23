@@ -101,13 +101,25 @@ impl Lab {
 
     /// cmd 里跑一段，返回 stdout。
     ///
-    /// `/v:on` 打开延迟展开：cmd 在**解析整行**时就把 `%VAR%` 换掉了，所以
-    /// `call x.cmd && echo %VAR%` 永远读不到 `x.cmd` 里刚 set 的值，必须写
-    /// `!VAR!`。
+    /// 两件事都踩过坑，所以写下来：
+    ///
+    /// * `/v:on` 打开延迟展开。cmd 在**解析整行**时就把 `%VAR%` 换掉了，所以
+    ///   `call x.cmd && echo %VAR%` 永远读不到 `x.cmd` 里刚 set 的值，必须写
+    ///   `!VAR!`。
+    /// * 脚本先落成 `.cmd` 再执行，不直接塞进 `/c` 参数：Rust 为 Windows 命令行
+    ///   加引号的方式撞上 cmd 解析 `/c "..."` 的规则，会把命令搅乱。落成文件也更
+    ///   接近用户真实的用法——把 `call` 那行敲进一个 cmd 会话。
     fn cmd(&self, script: &str) -> String {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let driver = self.root.join("tmp").join(format!(
+            "driver-{}.cmd",
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&driver, format!("@echo off\r\n{script}\r\n")).unwrap();
+
         let out = self
             .command("cmd")
-            .args(["/v:on", "/c", script])
+            .args(["/v:on", "/c", &driver.display().to_string()])
             .output()
             .expect("cmd 应该能启动");
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
@@ -217,8 +229,12 @@ fn disable_puts_the_user_variables_back() {
             failures.push(format!("{key} 该被删掉，实际还留着 {v:?}"));
         }
     }
-    if lab.read("user-stack").trim().is_empty() {
-        failures.push("user-stack 该被清掉".to_string());
+    // 反过来的：disable 之后这份记录该被删掉，文件不在才是对的。
+    if !lab.read("user-stack").trim().is_empty() {
+        failures.push(format!(
+            "disable 之后 user-stack 该被删掉，实际还在:\n{}",
+            lab.read("user-stack")
+        ));
     }
     // 选择仍然记着，裸 enable 能恢复。
     if !lab.read("startup").contains("work") {
@@ -368,7 +384,14 @@ fn the_shell_is_detected_from_the_environment() {
         .env("PSModulePath", r"C:\Modules")
         .output()
         .unwrap();
-    let cmd = lab.command(ENVC).args(["activate", "work"]).output().unwrap();
+    // 必须显式摘掉：跑测试的这个进程本身就带 PSModulePath，继承下去的话
+    // 「没有它」这个前提根本不成立。
+    let cmd = lab
+        .command(ENVC)
+        .args(["activate", "work"])
+        .env_remove("PSModulePath")
+        .output()
+        .unwrap();
 
     let mut failures = Vec::new();
     if !String::from_utf8_lossy(&ps.stdout).contains("$env:") {
