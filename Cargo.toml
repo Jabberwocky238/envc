@@ -1,6 +1,6 @@
 [package]
 name = "envc"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Profile based environment variable manager for bash"
@@ -11,6 +11,7 @@ name = "envc"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]

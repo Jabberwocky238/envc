@@ -12,10 +12,18 @@
 # replaces the binary in place. Pass --update to make it a no-op when the
 # installed version already matches, so it is safe to run from cron.
 #
+# Linux and macOS only. Windows has native binaries of its own; this script
+# prints the download link for them rather than pretending WSL is required.
+#
 set -euo pipefail
 
 REPO="${ENVC_REPO:-Jabberwocky238/envc}"
 BIN="envc"
+
+# Optional GitHub mirror, e.g. https://gh-proxy.com/ -- every github.com URL
+# the installer fetches is prefixed with it. Empty means fetch from GitHub
+# directly. See the README for the mainland-China setup.
+GH_PROXY="${ENVC_GH_PROXY:-}"
 
 VERSION=""
 BIN_DIR=""
@@ -33,6 +41,9 @@ die() { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 warn() { printf '%swarning:%s %s\n' "$C_DIM" "$C_RESET" "$*" >&2; }
 step() { printf '%s==>%s %s\n' "$C_BOLD" "$C_RESET" "$*"; }
 ok() { printf '%s  ok%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+
+# Prefix a github.com URL with the mirror, if one is configured.
+gh_url() { printf '%s%s' "$GH_PROXY" "$1"; }
 
 usage() {
     cat <<EOF
@@ -54,6 +65,8 @@ OPTIONS:
 ENVIRONMENT:
     ENVC_REPO       GitHub repo to install from  (default: $REPO)
     ENVC_BIN_DIR    Same as --bin-dir
+    ENVC_GH_PROXY   GitHub mirror prefix prepended to download URLs, e.g.
+                    https://gh-proxy.com/ (handy in mainland China)
     NO_COLOR        Disable colored output
 EOF
 }
@@ -115,8 +128,19 @@ detect_target() {
                 *) die "no prebuilt binary for macOS/$arch" ;;
             esac
             ;;
+        MINGW*|MSYS*|CYGWIN*)
+            # This script is POSIX; Windows has its own binaries. Point at the
+            # right one instead of telling the user to go find WSL.
+            case "$(uname -m)" in
+                aarch64|arm64) win="aarch64-pc-windows-msvc" ;;
+                *) win="x86_64-pc-windows-msvc" ;;
+            esac
+            die "this installer is for Linux and macOS.
+       on Windows download the binary for your machine instead:
+           https://github.com/$REPO/releases/latest/download/${BIN}-${win}.exe
+       put it on your PATH, then run \`${BIN} enable <name>\`" ;;
         *)
-            die "no prebuilt binary for $os; on Windows use WSL, or build from source" ;;
+            die "no prebuilt binary for $os; build from source with 'cargo build --release'" ;;
     esac
 }
 
@@ -166,7 +190,7 @@ sha256_of() {
 
 latest_tag() {
     need curl || return 1
-    curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null \
+    curl -fsSLI -o /dev/null -w '%{url_effective}' "$(gh_url "https://github.com/$REPO/releases/latest")" 2>/dev/null \
         | sed -n 's#.*/tag/##p'
 }
 
@@ -219,14 +243,14 @@ fi
 
 if [ -n "$VERSION" ]; then
     ASSET="${BIN}-${VERSION}-${TARGET}"
-    URL="https://github.com/$REPO/releases/download/${VERSION}/${ASSET}"
-    SUMS_URL="https://github.com/$REPO/releases/download/${VERSION}/SHA256SUMS"
+    URL="$(gh_url "https://github.com/$REPO/releases/download/${VERSION}/${ASSET}")"
+    SUMS_URL="$(gh_url "https://github.com/$REPO/releases/download/${VERSION}/SHA256SUMS")"
 else
     # No tag known (no curl, or the API was unreachable): the version-less
     # asset alias published with every release still works.
     ASSET="${BIN}-${TARGET}"
-    URL="https://github.com/$REPO/releases/latest/download/${ASSET}"
-    SUMS_URL="https://github.com/$REPO/releases/latest/download/SHA256SUMS"
+    URL="$(gh_url "https://github.com/$REPO/releases/latest/download/${ASSET}")"
+    SUMS_URL="$(gh_url "https://github.com/$REPO/releases/latest/download/SHA256SUMS")"
 fi
 
 TMP=$(mktemp -d)

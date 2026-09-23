@@ -1,8 +1,8 @@
 name: release
 
-# Pushing a tag like v0.1.0 builds the Linux and macOS binaries and attaches
-# them to a GitHub release. Run it by hand from the Actions tab to rebuild an
-# existing tag.
+# Pushing a tag like v0.1.0 runs the test suite on all three platforms, and only
+# if every one of them is green builds the binaries and attaches them to a
+# GitHub release. Run it by hand from the Actions tab to rebuild an existing tag.
 on:
   push:
     tags:
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -31,16 +31,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: unit tests
+      # One integration suite per platform, in tests/{linux,macos,windows}.rs.
+      # Each file carries its own `#![cfg(target_os = ...)]`, so this single
+      # command runs the matching one and compiles the others away to nothing.
+      - name: tests
         run: cargo test --locked
-
-      - name: end-to-end tests
-        run: |
-          cargo build --locked
-          bash tests/e2e.sh
 
   build:
     name: build (${{ matrix.target }})
+    # Six binaries only after all three suites pass.
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
@@ -51,6 +50,7 @@ jobs:
           # present everywhere makes the `if:` conditions unambiguous.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            ext: ""
             apt: ""
             linker: ""
 
@@ -58,17 +58,35 @@ jobs:
           # target libraries are needed beyond the C toolchain and linker.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            ext: ""
             apt: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
 
           # Apple's SDK targets both architectures from an Apple silicon runner.
           - target: aarch64-apple-darwin
             os: macos-latest
+            ext: ""
             apt: ""
             linker: ""
 
           - target: x86_64-apple-darwin
             os: macos-latest
+            ext: ""
+            apt: ""
+            linker: ""
+
+          # arm64 is cross-compiled; the runner's Visual Studio ships the ARM64
+          # toolchain. The `.exe` suffix is part of the asset name because that
+          # is the file a Windows user downloads and runs.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
+            apt: ""
+            linker: ""
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            ext: ".exe"
             apt: ""
             linker: ""
 
@@ -93,27 +111,23 @@ jobs:
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # bash on every runner (Windows included, via Git for Windows) so the
+      # same shell expands the same way.
       - name: package
+        shell: bash
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
           target="${{ matrix.target }}"
-          name="${BIN}-${version}-${target}"
+          ext="${{ matrix.ext }}"
+          name="${BIN}-${version}-${target}${ext}"
 
           # The bare binary, no archive. GitHub does not preserve the execute
           # bit on release assets, so the installer chmods what it downloads.
           mkdir -p dist
-          cp "target/${target}/release/${BIN}" "dist/${name}"
-          cp "target/${target}/release/${BIN}" "dist/${BIN}-${target}"
+          cp "target/${target}/release/${BIN}${ext}" "dist/${name}"
+          cp "target/${target}/release/${BIN}${ext}" "dist/${BIN}-${target}${ext}"
           chmod 755 dist/*
-
-          # Both names are listed: they are the same bytes, and the installer
-          # may have downloaded either one.
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd dist && sha256sum "${name}" "${BIN}-${target}" > "SHA256SUMS-${target}.txt")
-          else
-            (cd dist && shasum -a 256 "${name}" "${BIN}-${target}" > "SHA256SUMS-${target}.txt")
-          fi
 
           ls -l dist
 
@@ -133,12 +147,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: merge checksums
+      # One checksum file for all six, generated here rather than per target:
+      # `sha256sum` is not something a Windows runner can be relied on to have.
+      - name: checksums
         run: |
           set -euo pipefail
           cd dist
-          cat SHA256SUMS-*.txt | sort -k2 > SHA256SUMS
-          rm -f SHA256SUMS-*.txt
+          sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
       - uses: softprops/action-gh-release@v2

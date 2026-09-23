@@ -30,6 +30,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyhow::{anyhow, Context as _};
 use clap::{Parser, Subcommand};
 
 // ===========================================================================
@@ -38,34 +39,53 @@ use clap::{Parser, Subcommand};
 
 const PROFILE_ENV_FILE: &str = ".env";
 const STACK_FORMAT_VERSION: u32 = 1;
+const STARTUP_FORMAT_VERSION: u32 = 1;
 
+/// The variable that records which profile this shell has applied.
+const ENVC_ACTIVE_VAR: &str = "ENVC_ACTIVE";
+
+/// The markers that fence off envc's block inside an rc file. POSIX only.
+#[cfg(not(windows))]
 const BEGIN_MARKER: &str = "# >>> envc initialize >>>";
+#[cfg(not(windows))]
 const END_MARKER: &str = "# <<< envc initialize <<<";
 
 const AFTER_HELP: &str = "\
-HOW ACTIVATION WORKS:
+TWO HALVES:
+  Startup    -- `envc enable <name>` picks the profile new shells load and
+                installs the hook; `envc disable` stops it. Kept in
+                ~/.envc/startup, so it outlives any single shell.
+  This shell -- `envc activate <name>` applies a profile here;
+                `envc deactivate` undoes it. Neither changes the next shell.
+
+ACTIVATION:
   A child process cannot change its parent shell, so activate/deactivate print
-  shell code on stdout. Run them through the wrapper that `envc enable`
-  installs, or call them explicitly:
+  shell code on stdout. Run them through the wrapper `envc enable` installs, or:
 
       eval \"$(envc activate work)\"
-      eval \"$(envc deactivate)\"
 
-  Every variable a profile overrides is written to the restore stack
-  (~/.envc/stack) as a diff: the '-' lines are what the shell had before, the
-  '+' lines are what the profile installed. deactivate replays the '-' lines,
-  so variables the profile introduced are unset again and the ones it replaced
-  get their old values back.
+  Each override goes into the restore stack (~/.envc/stack) as the old value
+  against the new one; deactivate replays the old side.
+
+WINDOWS:
+  No rc file is read by both cmd and PowerShell, so `enable` puts the profile's
+  variables into the user environment instead: permanent, and visible to every
+  program started afterwards. `disable` restores the previous values.
+
+  Activation still only affects the current shell. PowerShell evaluates what is
+  printed; cmd has no `eval`, so the code goes to %TEMP%\\envc\\activate.cmd:
+
+      powershell   envc activate work | Invoke-Expression
+      cmd          envc activate work && call \"%TEMP%\\envc\\activate.cmd\"
 
 SHELL INTEGRATION:
-  `envc init` detects the login shell from $SHELL and injects the startup hook
-  into that shell's rc file -- ~/.zshrc on macOS, ~/.bashrc on Linux. Re-running
-  it is safe: an existing hook is detected and left alone.
+  `envc init` detects the login shell from $SHELL and injects the hook into
+  ~/.bashrc or ~/.zshrc. Re-running is safe.
 
 ENVIRONMENT:
   ENVC_HOME     envc directory                (default: ~/.envc)
   ENVC_RC       rc file to patch, overriding the detection
-                (default: ~/.zshrc or ~/.bashrc)
+  ENVC_SHELL    bash | powershell | cmd -- which syntax to emit
   NO_COLOR      disable colored output
 ";
 
@@ -73,46 +93,28 @@ ENVIRONMENT:
 // Errors
 // ===========================================================================
 
-/// An error worth showing the user. clap handles bad invocations itself, so
-/// this only covers runtime failures: missing profiles, unreadable files, ...
-#[derive(Debug)]
-struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
-
-fn err(msg: impl Into<String>) -> Error {
-    Error(msg.into())
-}
-
-type Result<T> = std::result::Result<T, Error>;
-
-/// Attach context to an `io::Error`, so messages read like
-/// `cannot read ~/.envc/profiles/work/.env: No such file or directory`.
-trait IoContext<T> {
-    fn ctx(self, what: impl fmt::Display) -> Result<T>;
-}
-
-impl<T> IoContext<T> for io::Result<T> {
-    fn ctx(self, what: impl fmt::Display) -> Result<T> {
-        self.map_err(|e| err(format!("{what}: {e}")))
-    }
-}
+/// Runtime failures only -- clap handles bad invocations itself. `anyhow` gives
+/// us the context chain for free, so there is no error type of our own here.
+type Result<T> = anyhow::Result<T>;
 
 // ===========================================================================
 // Paths
 // ===========================================================================
 
+/// Windows sets USERPROFILE (and, in shells that emulate POSIX, HOME); POSIX
+/// shells set HOME. Accepting both keeps `envc` usable from git-bash too.
 fn home_dir() -> Result<PathBuf> {
-    match std::env::var_os("HOME") {
-        Some(h) if !h.is_empty() => Ok(PathBuf::from(h)),
-        _ => Err(err("HOME is not set; cannot locate the envc directory")),
+    let names: &[&str] = if cfg!(windows) {
+        &["HOME", "USERPROFILE"]
+    } else {
+        &["HOME"]
+    };
+    for name in names {
+        if let Some(h) = std::env::var_os(name).filter(|h| !h.is_empty()) {
+            return Ok(PathBuf::from(h));
+        }
     }
+    Err(anyhow!("{} is not set", names.join(" / ")))
 }
 
 /// Root of everything envc manages. `ENVC_HOME` overrides it (tests use this).
@@ -141,13 +143,32 @@ fn stack_path() -> Result<PathBuf> {
     Ok(envc_home()?.join("stack"))
 }
 
-/// Which shell's startup file we are dealing with.
+/// `~/.envc/startup` -- the profile new shells load.
+fn startup_path() -> Result<PathBuf> {
+    Ok(envc_home()?.join("startup"))
+}
+
+/// `~/.envc/user-stack` -- Windows only: what the user-level variables held
+/// before `enable` overwrote them, so `disable` can put them back.
+///
+/// A separate file from the session stack: the two layers have different
+/// lifetimes (`deactivate` must not undo what `disable` is for), and they can
+/// both be live at once.
+#[cfg(windows)]
+fn user_stack_path() -> Result<PathBuf> {
+    Ok(envc_home()?.join("user-stack"))
+}
+
+/// Which shell's startup file we are dealing with. POSIX only: Windows has no
+/// rc file to pick.
+#[cfg(not(windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellKind {
     Bash,
     Zsh,
 }
 
+#[cfg(not(windows))]
 impl ShellKind {
     fn name(self) -> &'static str {
         match self {
@@ -177,6 +198,7 @@ impl ShellKind {
 
 /// Guess the login shell from `$SHELL`, falling back to the OS default. The rc
 /// file belongs to the login shell, not to whatever shell runs `envc`.
+#[cfg(not(windows))]
 fn detect_shell() -> ShellKind {
     if let Some(shell) = std::env::var_os("SHELL") {
         let name = Path::new(&shell)
@@ -195,6 +217,7 @@ fn detect_shell() -> ShellKind {
 }
 
 /// Where the detection came from, for the `init` report.
+#[cfg(not(windows))]
 fn detection_source() -> String {
     match std::env::var("SHELL") {
         Ok(s) if !s.is_empty() => format!("$SHELL={s}"),
@@ -206,6 +229,7 @@ fn detection_source() -> String {
 ///
 /// `ENVC_RC` overrides the detection; `ENVC_BASHRC` is accepted as a legacy
 /// alias for it.
+#[cfg(not(windows))]
 fn rc_file() -> Result<PathBuf> {
     for var in ["ENVC_RC", "ENVC_BASHRC"] {
         if let Some(p) = std::env::var_os(var) {
@@ -220,7 +244,7 @@ fn rc_file() -> Result<PathBuf> {
 /// Profile names become directory names, so keep them boring: no separators,
 /// no leading dot, no `..`.
 fn validate_profile_name(name: &str) -> Result<()> {
-    let bad = |why: &str| Err(err(format!("invalid profile name {name:?}: {why}")));
+    let bad = |why: &str| Err(anyhow!("invalid profile name {name:?}: {why}"));
 
     if name.is_empty() {
         return bad("must not be empty");
@@ -241,16 +265,35 @@ fn validate_profile_name(name: &str) -> Result<()> {
 }
 
 /// Show paths under $HOME as `~/...` to keep listings short.
-fn tildify(path: &Path) -> String {
-    if let Ok(home) = home_dir() {
-        if let Ok(rest) = path.strip_prefix(&home) {
-            if rest.as_os_str().is_empty() {
-                return "~".to_string();
-            }
-            return format!("~/{}", rest.display());
-        }
+///
+/// A `Display` wrapper rather than a function returning `String`, so it can be
+/// dropped straight into `format!` / `anyhow!` without allocating a temporary
+/// string first. Paths are tildified in loops (see `list`), so that adds up.
+struct Tilde<'a>(&'a Path);
+
+impl<'a> From<&'a Path> for Tilde<'a> {
+    fn from(path: &'a Path) -> Self {
+        Tilde(path)
     }
-    path.display().to_string()
+}
+
+impl fmt::Display for Tilde<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Compared against the raw HOME rather than `home_dir()`, which would
+        // allocate a PathBuf on every single formatting.
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+        if let Some(rest) = home
+            .as_deref()
+            .and_then(|home| self.0.strip_prefix(home).ok())
+        {
+            return if rest.as_os_str().is_empty() {
+                f.write_str("~")
+            } else {
+                write!(f, "~/{}", rest.display())
+            };
+        }
+        write!(f, "{}", self.0.display())
+    }
 }
 
 // ===========================================================================
@@ -277,14 +320,93 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// `export KEY='value'`
-fn export_line(key: &str, value: &str) -> String {
-    format!("export {key}={}", quote(value))
+/// PowerShell takes the same trick as bash, with a different escape: doubling
+/// the quote instead of closing and reopening it.
+fn quote_powershell(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
-/// `unset KEY`
-fn unset_line(key: &str) -> String {
-    format!("unset {key}")
+/// cmd is the odd one out: there is no quoting to speak of, only the
+/// `set "KEY=VALUE"` form, which ends at the *last* quote on the line. A `%`
+/// would be read as a variable reference inside a batch file, so it is doubled.
+fn set_cmd(key: &str, value: &str) -> String {
+    format!("set \"{key}={}\"", value.replace('%', "%%"))
+}
+
+/// Which shell's syntax to emit.
+///
+/// bash and zsh take identical code, so they share `Posix`. Windows has no
+/// `eval`, which is why `Cmd` does not print anything evaluable at all.
+// The variant is named after the shell it means; clippy's "ends with the enum
+// name" is exactly what is wanted here.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    Posix,
+    PowerShell,
+    Cmd,
+}
+
+impl Shell {
+    fn name(self) -> &'static str {
+        match self {
+            Shell::Posix => "bash",
+            Shell::PowerShell => "powershell",
+            Shell::Cmd => "cmd",
+        }
+    }
+
+    /// `--shell` / `ENVC_SHELL`, else guess.
+    fn resolve(flag: Option<&str>) -> Result<Self> {
+        let wanted = flag.map(str::to_string).or_else(|| {
+            std::env::var("ENVC_SHELL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+
+        match wanted.as_deref().map(str::trim) {
+            None => Ok(Shell::detect()),
+            Some("bash" | "zsh" | "sh" | "posix") => Ok(Shell::Posix),
+            Some("powershell" | "pwsh" | "ps") => Ok(Shell::PowerShell),
+            Some("cmd" | "cmd.exe" | "bat" | "batch") => Ok(Shell::Cmd),
+            Some(other) => Err(anyhow!(
+                "unknown shell {other:?}; expected bash, powershell or cmd"
+            )),
+        }
+    }
+
+    /// PowerShell exports `PSModulePath` to every session it starts, including
+    /// the ones it hands to a child process; cmd does not. That is the only
+    /// signal available from inside the child.
+    fn detect() -> Self {
+        if cfg!(windows) {
+            if std::env::var_os("PSModulePath").is_some() {
+                Shell::PowerShell
+            } else {
+                Shell::Cmd
+            }
+        } else {
+            Shell::Posix
+        }
+    }
+
+    fn assign(self, key: &str, value: &str) -> String {
+        match self {
+            Shell::Posix => format!("export {key}={}", quote(value)),
+            Shell::PowerShell => format!("$env:{key}={}", quote_powershell(value)),
+            Shell::Cmd => set_cmd(key, value),
+        }
+    }
+
+    fn unset(self, key: &str) -> String {
+        match self {
+            Shell::Posix => format!("unset {key}"),
+            Shell::PowerShell => {
+                format!("Remove-Item Env:{key} -ErrorAction SilentlyContinue")
+            }
+            Shell::Cmd => set_cmd(key, ""),
+        }
+    }
 }
 
 /// A valid sh variable name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -297,14 +419,45 @@ fn is_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Write shell code to stdout. Write errors are ignored: a closed pipe
-/// (`envc list | head`) is not worth reporting.
-fn emit(lines: &[String]) {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    for line in lines {
-        let _ = writeln!(out, "{line}");
+/// Hand the generated shell code to the caller.
+///
+/// POSIX shells and PowerShell evaluate what lands on stdout. cmd cannot -- there
+/// is no `eval` -- so the code goes into a batch file and the caller is told to
+/// `call` it. The file name is fixed, so the idiom can be written down once:
+///
+///     envc activate work && call "%TEMP%\envc\activate.cmd"
+fn emit(shell: Shell, what: &str, lines: &[String]) -> Result<()> {
+    if shell != Shell::Cmd {
+        // Write errors are ignored: a closed pipe (`envc list | head`) is not
+        // worth reporting.
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
+        return Ok(());
     }
+
+    let path = batch_path(what)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", Tilde(dir)))?;
+    }
+    // cmd wants CRLF, and a batch file starts with echo off or every line shows.
+    let mut body = String::from("@echo off\r\n");
+    for line in lines {
+        body.push_str(line);
+        body.push_str("\r\n");
+    }
+    std::fs::write(&path, body).with_context(|| format!("cannot write {}", Tilde(&path)))?;
+
+    eprintln!("envc: wrote {}", Tilde(&path));
+    eprintln!("envc: in cmd, run: call \"{}\"", path.display());
+    Ok(())
+}
+
+/// `%TEMP%\envc\<what>.cmd` -- the hand-off file for cmd.
+fn batch_path(what: &str) -> Result<PathBuf> {
+    Ok(std::env::temp_dir().join("envc").join(format!("{what}.cmd")))
 }
 
 // ===========================================================================
@@ -319,8 +472,8 @@ struct Assignment {
 
 /// Read and parse a profile's `.env`.
 fn parse_env_file(path: &Path) -> Result<Vec<Assignment>> {
-    let content = std::fs::read_to_string(path).ctx(format!("cannot read {}", tildify(path)))?;
-    parse_env(&content, &tildify(path))
+    let content = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", Tilde(path)))?;
+    parse_env(&content, Tilde(path))
 }
 
 /// Parse `.env` content. `origin` only appears in error messages.
@@ -332,18 +485,22 @@ fn parse_env_file(path: &Path) -> Result<Vec<Assignment>> {
 /// ROOT=/opt/app
 /// BIN=$ROOT/bin     # -> /opt/app/bin
 /// ```
-fn parse_env(content: &str, origin: &str) -> Result<Vec<Assignment>> {
+fn parse_env(content: &str, origin: impl fmt::Display) -> Result<Vec<Assignment>> {
     let mut env: HashMap<String, String> = std::env::vars().collect();
     let mut out = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0;
 
-    for (idx, raw) in content.lines().enumerate() {
+    while idx < lines.len() {
         let lineno = idx + 1;
-        let line = raw.trim();
+        let line = lines[idx].trim();
+        idx += 1;
+
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
 
-        let fail = |msg: &str| err(format!("{origin}:{lineno}: {msg}"));
+        let fail = |msg: &str| anyhow!("{origin}:{lineno}: {msg}");
 
         let Some((raw_key, raw_value)) = strip_export(line).split_once('=') else {
             return Err(fail("expected `KEY=value`"));
@@ -354,8 +511,29 @@ fn parse_env(content: &str, origin: &str) -> Result<Vec<Assignment>> {
             return Err(fail(&format!("{key:?} is not a valid variable name")));
         }
 
-        let value = parse_value(raw_value.trim(), &env)
-            .map_err(|e| fail(&format!("in the value of {key}: {e}")))?;
+        // A quoted section is allowed to stay open past the end of the line, so
+        // feed it more lines until it closes and let the newlines become part
+        // of the value. Only the first line is left-trimmed: what follows is
+        // inside the quotes, where whitespace is content. (`lines()` has
+        // already dropped any `\r`, and unquoted trailing space is dropped by
+        // parse_value itself.)
+        let mut raw = raw_value.trim_start().to_string();
+        let value = loop {
+            match parse_value(&raw, &env) {
+                Ok(value) => break Ok(value),
+                Err(ValueError::Unterminated(q)) => {
+                    if idx >= lines.len() {
+                        break Err(fail(&format!(
+                            "in the value of {key}: unterminated {q} quote"
+                        )));
+                    }
+                    raw.push('\n');
+                    raw.push_str(lines[idx]);
+                    idx += 1;
+                }
+                Err(e) => break Err(fail(&format!("in the value of {key}: {e}"))),
+            }
+        }?;
 
         env.insert(key.to_string(), value.clone());
         out.push(Assignment {
@@ -375,49 +553,88 @@ fn strip_export(line: &str) -> &str {
     }
 }
 
-fn parse_value(raw: &str, env: &HashMap<String, String>) -> std::result::Result<String, String> {
+/// Why a value could not be turned into text.
+enum ValueError {
+    /// A quoted section was opened and never closed. A quoted value is allowed
+    /// to span lines, so the caller can pull in the next line and try again;
+    /// at the end of the file this is a real error.
+    Unterminated(char),
+    Other(String),
+}
+
+impl fmt::Display for ValueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValueError::Unterminated(q) => write!(f, "unterminated {q} quote"),
+            ValueError::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Turn the text after `=` into the value it stands for.
+///
+/// Quoting is deliberately conservative about what counts as a quote:
+///
+///   * `'...'` is literal, `"..."` expands and honours backslash escapes;
+///   * a quote only *opens* a section at a boundary -- at the start of the
+///     value, or straight after a section closed. Anywhere else it is an
+///     ordinary character;
+///   * inside a section, the other quote character is ordinary too.
+///
+/// That is what keeps `MSG=don't stop` and `PATH=C:\a"b` intact. Being
+/// permissive here would silently eat the quote, and losing a character the
+/// user typed is worse than leaving it visible.
+fn parse_value(raw: &str, env: &HashMap<String, String>) -> std::result::Result<String, ValueError> {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
     // Unquoted whitespace is held back until we know it is not trailing, so
     // `KEY=a   ` loses its spaces while `KEY="a "` keeps them.
     let mut pending = String::new();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
+    // Which section we are inside, if any.
+    let mut quote: Option<char> = None;
+    // Whether the unquoted run so far is empty, i.e. whether a quote here would
+    // be starting a section rather than being part of the text.
+    let mut at_boundary = true;
 
     while i < chars.len() {
         let c = chars[i];
 
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            } else {
-                out.push(c);
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                at_boundary = true;
+                i += 1;
+                continue;
             }
-            i += 1;
-            continue;
+            if q == '\'' {
+                // Single quotes are literal: nothing inside is special.
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            // Inside double quotes, fall through: `$`, `\` and the comment
+            // check still apply, but `'` does not close anything.
         }
 
         match c {
-            '\'' if !in_double => {
+            '\'' | '"' if quote.is_none() && at_boundary => {
                 flush(&mut out, &mut pending);
-                in_single = true;
-                i += 1;
-            }
-            '"' if !in_double => {
-                flush(&mut out, &mut pending);
-                in_double = true;
+                quote = Some(c);
                 i += 1;
             }
             '\'' | '"' => {
                 flush(&mut out, &mut pending);
-                in_double = false;
+                out.push(c);
+                at_boundary = false;
                 i += 1;
             }
             '\\' => {
                 i += 1;
-                let next = *chars.get(i).ok_or("trailing backslash")?;
-                let expanded = if in_double {
+                let next = *chars
+                    .get(i)
+                    .ok_or_else(|| ValueError::Other("trailing backslash".to_string()))?;
+                let expanded = if quote == Some('"') {
                     match next {
                         'n' => '\n',
                         't' => '\t',
@@ -429,28 +646,36 @@ fn parse_value(raw: &str, env: &HashMap<String, String>) -> std::result::Result<
                 };
                 flush(&mut out, &mut pending);
                 out.push(expanded);
+                at_boundary = false;
                 i += 1;
             }
             '$' => {
-                let (value, next_i) = expand(&chars, i, env)?;
+                let (value, next_i) = expand(&chars, i, env).map_err(ValueError::Other)?;
                 flush(&mut out, &mut pending);
+                // An expansion that produced nothing leaves us still at a
+                // boundary, so `KEY=$EMPTY'x'` still reads as quoted.
+                at_boundary = at_boundary && value.is_empty();
                 out.push_str(&value);
                 i = next_i;
             }
-            '#' if !in_double && starts_comment(&chars, i) => break,
-            c if c.is_whitespace() && !in_double => {
+            '#' if quote != Some('"') && starts_comment(&chars, i) => break,
+            c if c.is_whitespace() && quote.is_none() => {
                 pending.push(c);
                 i += 1;
             }
             _ => {
                 flush(&mut out, &mut pending);
                 out.push(c);
+                at_boundary = false;
                 i += 1;
             }
         }
     }
 
-    Ok(out)
+    match quote {
+        Some(q) => Err(ValueError::Unterminated(q)),
+        None => Ok(out),
+    }
 }
 
 fn flush(out: &mut String, pending: &mut String) {
@@ -633,46 +858,11 @@ impl Stack {
         }
     }
 
-    /// `Ok(None)` when nothing is active.
-    fn load() -> Result<Option<Stack>> {
-        let path = stack_path()?;
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(err(format!("cannot read {}: {e}", tildify(&path)))),
-        };
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-        parse_stack(&content, &tildify(&path)).map(Some)
-    }
-
-    fn save(&self) -> Result<()> {
-        let dir = envc_home()?;
-        std::fs::create_dir_all(&dir).ctx(format!("cannot create {}", tildify(&dir)))?;
-        let path = stack_path()?;
-        std::fs::write(&path, self.render())
-            .ctx(format!("cannot write {}", tildify(&path)))
-    }
-
-    /// Delete the stack file. A missing file is not an error.
-    fn remove() -> Result<()> {
-        let path = stack_path()?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(err(format!("cannot remove {}: {e}", tildify(&path)))),
-        }
-    }
-
     fn render(&self) -> String {
         let mut s = String::new();
-        s.push_str("# envc restore stack -- written by `envc activate`, replayed by `envc deactivate`.\n");
-        s.push_str("#\n");
-        s.push_str("# A '-' line is what the shell held before the profile was applied, the\n");
-        s.push_str("# '+' line under it is what the profile installed. A line with no `=value`\n");
-        s.push_str("# means the variable was not set at all, so undoing it means `unset`.\n");
-        s.push_str("#\n");
+        s.push_str("# envc restore stack -- `activate` writes it, `deactivate` replays it.\n");
+        s.push_str("# '-' is the value before the profile, '+' what it installed.\n");
+        s.push_str("# A side with no `=value` means unset, so undoing it is `unset`.\n");
         s.push_str(&format!("# format {STACK_FORMAT_VERSION}\n"));
         s.push_str(&format!("# active-profile {}\n", self.profile));
         s.push_str("--- before envc\n");
@@ -685,13 +875,13 @@ impl Stack {
     }
 
     /// Shell lines that undo every override, newest first.
-    fn restore_lines(&self) -> Vec<String> {
+    fn restore_lines(&self, shell: Shell) -> Vec<String> {
         self.entries
             .iter()
             .rev()
             .map(|e| match &e.prev {
-                Some(v) => export_line(&e.key, v),
-                None => unset_line(&e.key),
+                Some(v) => shell.assign(&e.key, v),
+                None => shell.unset(&e.key),
             })
             .collect()
     }
@@ -721,6 +911,225 @@ impl Stack {
             })
             .collect()
     }
+}
+
+/// The profile new shells load, chosen by `envc enable <name>`.
+///
+/// This is deliberately not the restore stack. The stack is per-shell
+/// bookkeeping that `deactivate` replays; this file is the persistent answer to
+/// "what should the rc hook apply in a fresh shell?". Only `enable` writes it,
+/// so `activate` cannot change what the next shell starts with.
+#[derive(Debug, Clone)]
+struct Startup {
+    profile: String,
+}
+
+impl Startup {
+    fn render(&self) -> String {
+        format!(
+            "# envc startup profile -- what new shells load through the rc hook.\n\
+             # `envc enable <name>` writes it; `envc disable` keeps it, stopped.\n\
+             # format {STARTUP_FORMAT_VERSION}\n\
+             {}\n",
+            self.profile
+        )
+    }
+}
+
+/// The file is a comment header plus one bare profile name, so a hand-edited
+/// file cannot break startup: anything unparseable simply means "no choice".
+fn parse_startup(content: &str) -> Option<Startup> {
+    let profile = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+    Some(Startup {
+        profile: profile.to_string(),
+    })
+}
+
+// ===========================================================================
+// Persisted state
+// ===========================================================================
+
+/// The three filesystem methods every piece of persisted state needs: read and
+/// parse, create the directory and render, and a removal that tolerates a
+/// missing file. `Stack` and `Startup` are exactly this shape.
+///
+/// `$parse` gets the file's contents and its path, and answers `Ok(None)` when
+/// the file holds no state at all.
+macro_rules! state_file {
+    ($ty:ident, $path:ident, $parse:ident) => {
+        impl $ty {
+            /// `Ok(None)` when the file is absent, empty, or holds no state.
+            fn load() -> Result<Option<Self>> {
+                let path = $path()?;
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(anyhow!("cannot read {}: {e}", Tilde(&path))),
+                };
+                $parse(&content, &path)
+            }
+
+            fn save(&self) -> Result<()> {
+                let dir = envc_home()?;
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("cannot create {}", Tilde(&dir)))?;
+                let path = $path()?;
+                std::fs::write(&path, self.render())
+                    .with_context(|| format!("cannot write {}", Tilde(&path)))
+            }
+
+            /// Removing a file that was never written is not an error.
+            fn remove() -> Result<()> {
+                let path = $path()?;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(anyhow!("cannot remove {}: {e}", Tilde(&path))),
+                }
+            }
+        }
+    };
+}
+
+state_file!(Stack, stack_path, parse_stack_state);
+state_file!(Startup, startup_path, parse_startup_state);
+
+/// Windows: the user-level variables an `enable` overwrote.
+///
+/// Same diff format and same rendering as the session stack -- only the file
+/// differs, because the two layers are independent.
+#[cfg(windows)]
+struct UserStack(Stack);
+
+#[cfg(windows)]
+impl UserStack {
+    fn render(&self) -> String {
+        self.0.render()
+    }
+}
+
+#[cfg(windows)]
+state_file!(UserStack, user_stack_path, parse_user_stack_state);
+
+#[cfg(windows)]
+fn parse_user_stack_state(content: &str, path: &Path) -> Result<Option<UserStack>> {
+    Ok(parse_stack_state(content, path)?.map(UserStack))
+}
+
+// ===========================================================================
+// Windows: permanent user-level variables
+// ===========================================================================
+
+/// Run a PowerShell snippet and return its stdout.
+///
+/// `-NoProfile` so a user's profile cannot change the result, and
+/// `-NonInteractive` so it can never sit there waiting for input.
+#[cfg(windows)]
+fn powershell(script: &str) -> Result<String> {
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .with_context(|| "cannot run powershell")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "powershell failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Read the current user-level value of each key. `None` means "not set at the
+/// user level", which is what makes `disable` able to remove rather than blank.
+///
+/// One line per key: `KEY=value`, or just `KEY` when it was unset. Values
+/// containing newlines cannot be told apart from the line ending -- user-level
+/// variables rarely are, and the alternative is a base64 layer for them.
+#[cfg(windows)]
+fn read_user_vars(keys: &[&str]) -> Result<HashMap<String, Option<String>>> {
+    let list = keys
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "{list} | ForEach-Object {{ $v = [Environment]::GetEnvironmentVariable($_,'User'); \
+         if ($null -eq $v) {{ $_ }} else {{ \"$_=$v\" }} }}"
+    );
+
+    let mut found = HashMap::new();
+    for line in powershell(&script)?.lines() {
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k, Some(v.to_string())),
+            None => (line, None),
+        };
+        found.insert(key.trim().to_string(), value);
+    }
+    Ok(found)
+}
+
+/// Set (or, for `None`, remove) user-level variables in one PowerShell run.
+#[cfg(windows)]
+fn write_user_vars(pairs: &[(String, Option<String>)]) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let script = pairs
+        .iter()
+        .map(|(k, v)| match v {
+            Some(v) => format!(
+                "[Environment]::SetEnvironmentVariable('{k}',{},'User')",
+                quote_powershell(v)
+            ),
+            None => format!("[Environment]::SetEnvironmentVariable('{k}',$null,'User')"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    powershell(&script)?;
+    Ok(())
+}
+
+/// An empty restore stack means "nothing is active", so it reads as no state.
+fn parse_stack_state(content: &str, path: &Path) -> Result<Option<Stack>> {
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_stack(content, Tilde(path)).map(Some)
+}
+
+fn parse_startup_state(content: &str, _path: &Path) -> Result<Option<Startup>> {
+    Ok(parse_startup(content))
+}
+
+/// The chosen startup profile, falling back to the restore stack for installs
+/// that predate this file -- before, `activate` was what chose it, and starting
+/// to load nothing after an upgrade would be a nasty surprise. The adoption is
+/// announced once, then persisted so it never happens again.
+fn remembered_startup() -> Result<Option<String>> {
+    if let Some(startup) = Startup::load()? {
+        return Ok(Some(startup.profile));
+    }
+
+    let Some(stack) = Stack::load()? else {
+        return Ok(None);
+    };
+    let profile = stack.profile;
+    if !profile_env_file(&profile)?.is_file() {
+        return Ok(None);
+    }
+
+    Startup {
+        profile: profile.clone(),
+    }
+    .save()?;
+    eprintln!(
+        "envc: '{profile}' is now the startup profile (it was selected before the upgrade; \
+         `envc enable <name>` changes it)"
+    );
+    Ok(Some(profile))
 }
 
 fn render_side(key: &str, value: Option<&str>) -> String {
@@ -767,7 +1176,7 @@ fn unescape_value(value: &str) -> String {
     s
 }
 
-fn parse_stack(content: &str, origin: &str) -> Result<Stack> {
+fn parse_stack(content: &str, origin: impl fmt::Display) -> Result<Stack> {
     let mut version = STACK_FORMAT_VERSION;
     let mut profile: Option<String> = None;
     let mut entries: Vec<Entry> = Vec::new();
@@ -779,7 +1188,7 @@ fn parse_stack(content: &str, origin: &str) -> Result<Stack> {
         if line.is_empty() {
             continue;
         }
-        let fail = |msg: String| err(format!("{origin}:{lineno}: {msg}"));
+        let fail = |msg: String| anyhow!("{origin}:{lineno}: {msg}");
 
         if let Some(rest) = line.strip_prefix('#') {
             let rest = rest.trim();
@@ -823,22 +1232,22 @@ fn parse_stack(content: &str, origin: &str) -> Result<Stack> {
     }
 
     if let Some((key, _)) = pending {
-        return Err(err(format!("{origin}: '{key}' has a '-' line but no '+' line")));
+        return Err(anyhow!("{origin}: '{key}' has a '-' line but no '+' line"));
     }
     if version != STACK_FORMAT_VERSION {
-        return Err(err(format!(
+        return Err(anyhow!(
             "{origin}: written with stack format {version}, this build understands {STACK_FORMAT_VERSION}"
-        )));
+        ));
     }
     let Some(profile) = profile else {
-        return Err(err(format!(
+        return Err(anyhow!(
             "{origin}: missing a `# active-profile <name>` line"
-        )));
+        ));
     };
     Ok(Stack { profile, entries })
 }
 
-fn split_side<F: Fn(String) -> Error>(
+fn split_side<F: Fn(String) -> anyhow::Error>(
     side: &str,
     fail: &F,
 ) -> Result<(String, Option<String>)> {
@@ -859,15 +1268,16 @@ fn split_side<F: Fn(String) -> Error>(
 /// The block `envc enable` appends to ~/.bashrc. It defines an `envc` shell
 /// function that evals the output of activate/deactivate, then re-applies the
 /// selected profile via `envc autoload`.
+#[cfg(not(windows))]
 fn hook_block() -> String {
     format!(
         "\n{BEGIN_MARKER}\n\
-         # Managed by `envc enable` / `envc disable` -- do not edit this block by hand.\n\
+         # envc -- managed; do not edit.\n\
          if command -v envc >/dev/null 2>&1; then\n\
          \x20   envc() {{\n\
          \x20       case \"${{1:-}}\" in\n\
          \x20           activate|use|deactivate|de|unuse)\n\
-         \x20               # ENVC_WRAPPED tells the binary its output is being eval'd.\n\
+         \x20               # ENVC_WRAPPED: output is eval'd, not printed.\n\
          \x20               eval \"$(ENVC_WRAPPED=1 command envc \"$@\")\"\n\
          \x20               ;;\n\
          \x20           *)\n\
@@ -881,19 +1291,22 @@ fn hook_block() -> String {
     )
 }
 
+#[cfg(not(windows))]
 fn read_if_exists(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(c) => Ok(c),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(err(format!("cannot read {}: {e}", tildify(path)))),
+        Err(e) => Err(anyhow!("cannot read {}: {e}", Tilde(path))),
     }
 }
 
+#[cfg(not(windows))]
 fn rc_is_enabled() -> Result<bool> {
     let content = read_if_exists(&rc_file()?)?;
     Ok(content.contains(BEGIN_MARKER))
 }
 
+#[cfg(not(windows))]
 #[derive(Debug, PartialEq, Eq)]
 enum EnableOutcome {
     /// The hook was appended for the first time.
@@ -902,6 +1315,7 @@ enum EnableOutcome {
     Refreshed,
 }
 
+#[cfg(not(windows))]
 fn rc_enable() -> Result<EnableOutcome> {
     let path = rc_file()?;
     let content = read_if_exists(&path)?;
@@ -911,7 +1325,7 @@ fn rc_enable() -> Result<EnableOutcome> {
         updated.push('\n');
     }
     updated.push_str(&hook_block());
-    std::fs::write(&path, updated).ctx(format!("cannot write {}", tildify(&path)))?;
+    std::fs::write(&path, updated).with_context(|| format!("cannot write {}", Tilde(&path)))?;
 
     Ok(if had_block {
         EnableOutcome::Refreshed
@@ -921,18 +1335,20 @@ fn rc_enable() -> Result<EnableOutcome> {
 }
 
 /// Returns `true` when a block was actually removed.
+#[cfg(not(windows))]
 fn rc_disable() -> Result<bool> {
     let path = rc_file()?;
     let content = read_if_exists(&path)?;
     let (stripped, had_block) = strip_block(&content);
     if had_block {
-        std::fs::write(&path, stripped).ctx(format!("cannot write {}", tildify(&path)))?;
+        std::fs::write(&path, stripped).with_context(|| format!("cannot write {}", Tilde(&path)))?;
     }
     Ok(had_block)
 }
 
 /// Remove everything from the begin marker to the end marker inclusive, plus
 /// the blank separator line in front of it.
+#[cfg(not(windows))]
 fn strip_block(content: &str) -> (String, bool) {
     let mut out = String::new();
     let mut inside = false;
@@ -978,23 +1394,23 @@ fn cmd_create(name: &str, force: bool) -> Result<()> {
     let file = profile_env_file(name)?;
 
     if file.exists() && !force {
-        return Err(err(format!(
+        return Err(anyhow!(
             "profile '{name}' already exists ({}); pass --force to overwrite it",
-            tildify(&file)
-        )));
+            Tilde(&file)
+        ));
     }
 
-    std::fs::create_dir_all(&dir).ctx(format!("cannot create {}", tildify(&dir)))?;
-    std::fs::write(&file, template(name)).ctx(format!("cannot write {}", tildify(&file)))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", Tilde(&dir)))?;
+    std::fs::write(&file, template(name)).with_context(|| format!("cannot write {}", Tilde(&file)))?;
 
     println!("created profile '{name}'");
-    println!("  env file: {}", tildify(&file));
+    println!("  env file: {}", Tilde(&file));
     println!("  edit it, then run: envc activate {name}");
 
-    if !rc_is_enabled()? {
+    if !startup_is_on()? {
         println!();
         println!("note: startup loading is off, so new shells will not load this profile.");
-        println!("      run `envc init` to turn it on.");
+        println!("      run `envc enable {name}` to turn it on.");
     }
     Ok(())
 }
@@ -1007,14 +1423,16 @@ fn template(name: &str) -> String {
 
 fn cmd_list() -> Result<()> {
     let dir = profiles_dir()?;
-    let active = Stack::load()?.map(|s| s.profile);
+    // The marker tracks the startup choice, not this shell: that is the one
+    // that survives, and the one `enable` talks about.
+    let startup = Startup::load()?.map(|s| s.profile);
     let c = Palette::new();
 
     let mut names = Vec::new();
     match std::fs::read_dir(&dir) {
         Ok(entries) => {
             for entry in entries {
-                let entry = entry.ctx(format!("cannot read {}", tildify(&dir)))?;
+                let entry = entry.with_context(|| format!("cannot read {}", Tilde(&dir)))?;
                 if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     if let Some(name) = entry.file_name().to_str() {
                         names.push(name.to_string());
@@ -1023,7 +1441,7 @@ fn cmd_list() -> Result<()> {
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(err(format!("cannot read {}: {e}", tildify(&dir)))),
+        Err(e) => return Err(anyhow!("cannot read {}: {e}", Tilde(&dir))),
     }
     names.sort();
 
@@ -1031,7 +1449,7 @@ fn cmd_list() -> Result<()> {
         println!("no profiles yet.");
         println!("create one with: envc create <name>");
         println!();
-        print_startup_line(&c, active.as_deref())?;
+        print_startup_line(&c, startup.as_deref())?;
         return Ok(());
     }
 
@@ -1045,7 +1463,9 @@ fn cmd_list() -> Result<()> {
             Err(e) => ("!".to_string(), Some(e.to_string())),
         };
         width = width.max(name.chars().count());
-        rows.push((name.clone(), count, error, tildify(&file)));
+        // The path itself, not a pre-rendered string: it is tildified once, on
+        // the way to stdout.
+        rows.push((name.clone(), count, error, file));
     }
 
     // Two leading spaces: one for the active marker, one as a separator.
@@ -1057,10 +1477,11 @@ fn cmd_list() -> Result<()> {
         width = width
     );
     for (name, count, error, file) in &rows {
-        let is_active = active.as_deref() == Some(name.as_str());
-        let marker = if is_active { c.green("*") } else { " ".to_string() };
+        let is_startup = startup.as_deref() == Some(name.as_str());
+        let marker = if is_startup { c.green("*") } else { " ".to_string() };
         let label = format!("{name:<width$}", width = width);
-        let label = if is_active { c.bold(&label) } else { label };
+        let label = if is_startup { c.bold(&label) } else { label };
+        let file = Tilde(file);
         let file = if error.is_some() { c.red(file) } else { c.dim(file) };
         println!("{marker} {label}  {count:>4}  {file}");
     }
@@ -1070,38 +1491,78 @@ fn cmd_list() -> Result<()> {
             eprintln!("envc: profile '{name}' could not be parsed: {e}");
         }
     }
-    if let Some(active) = &active {
-        if !names.contains(active) {
+    if let Some(startup) = &startup {
+        if !names.contains(startup) {
             eprintln!(
-                "envc: active profile '{active}' has no directory under {}",
-                tildify(&dir)
+                "envc: startup profile '{startup}' has no directory under {}",
+                Tilde(&dir)
             );
         }
     }
 
     println!();
-    print_startup_line(&c, active.as_deref())?;
+    print_startup_line(&c, startup.as_deref())?;
     Ok(())
 }
 
-fn print_startup_line(c: &Palette, active: Option<&str>) -> Result<()> {
-    let rc = rc_file()?;
-    let enabled = rc_is_enabled()?;
+/// Is startup loading on?
+///
+/// POSIX shells read the hook in the rc file; Windows has no such file, so the
+/// equivalent evidence is that the user-level variables are currently applied.
+#[cfg(not(windows))]
+fn startup_is_on() -> Result<bool> {
+    rc_is_enabled()
+}
+
+#[cfg(windows)]
+fn startup_is_on() -> Result<bool> {
+    Ok(UserStack::load()?.is_some())
+}
+
+/// Where startup loading lives, for the reports.
+#[cfg(not(windows))]
+fn startup_where() -> Result<String> {
+    Ok(Tilde(&rc_file()?).to_string())
+}
+
+#[cfg(windows)]
+fn startup_where() -> Result<String> {
+    Ok("user environment".to_string())
+}
+
+fn print_startup_line(c: &Palette, startup: Option<&str>) -> Result<()> {
+    let enabled = startup_is_on()?;
     let state = if enabled {
         c.green("enabled")
     } else {
         c.yellow("disabled")
     };
     let suffix = if enabled {
-        format!(" ({})", tildify(&rc))
+        format!(" ({})", startup_where()?)
     } else {
         String::new()
     };
     println!("startup loading: {state}{suffix}");
 
-    match active {
-        Some(name) => println!("selected profile: {}", c.bold(name)),
-        None => println!("selected profile: (none)"),
+    match (enabled, startup) {
+        (true, Some(name)) => println!("startup profile: {}", c.bold(name)),
+        (true, None) => println!("startup profile: (none -- `envc enable <name>`)"),
+        // Remembered but not loading: saying "work" alone would read as if new
+        // shells were about to load it.
+        (false, Some(name)) => println!(
+            "startup profile: {} {}",
+            c.bold(name),
+            c.dim("(remembered, loading off)")
+        ),
+        (false, None) => println!("startup profile: (none)"),
+    }
+
+    // The other half, when it disagrees with the startup choice.
+    if let Ok(current) = std::env::var("ENVC_ACTIVE") {
+        if enabled && startup == Some(current.as_str()) {
+            return Ok(());
+        }
+        println!("this shell:      {current}");
     }
     Ok(())
 }
@@ -1111,42 +1572,60 @@ fn cmd_delete(name: &str, force: bool, quiet: bool) -> Result<()> {
 
     let dir = profile_dir(name)?;
     if !dir.is_dir() {
-        return Err(err(format!("no such profile: {name}")));
+        return Err(anyhow!("no such profile: {name}"));
     }
 
     let active = Stack::load()?.map(|s| s.profile);
     let is_active = active.as_deref() == Some(name);
+    let is_startup = Startup::load()?.map(|s| s.profile).as_deref() == Some(name);
 
-    if is_active && !force {
-        return Err(err(format!(
-            "profile '{name}' is currently active; run `envc deactivate` first, or pass --force"
-        )));
+    if (is_active || is_startup) && !force {
+        let why = if is_active {
+            "currently active; run `envc deactivate` first"
+        } else {
+            "the startup profile; run `envc disable` first"
+        };
+        return Err(anyhow!(
+            "profile '{name}' is {why}, or pass --force"
+        ));
     }
 
-    std::fs::remove_dir_all(&dir).ctx(format!("cannot remove {}", tildify(&dir)))?;
+    std::fs::remove_dir_all(&dir).with_context(|| format!("cannot remove {}", Tilde(&dir)))?;
 
-    if is_active {
-        Stack::remove()?;
-        notify(quiet, format!("cleared the restore stack for the deleted profile '{name}'"));
+    if is_startup {
+        Startup::remove()?;
+        notify(
+            quiet,
+            format!("cleared the startup profile ('{name}' deleted)"),
+        );
         if !quiet {
-            eprintln!("envc: warning: this shell still holds the variables it exported;");
-            eprintln!("envc:          run `envc deactivate` to drop them, or open a new shell.");
+            eprintln!("envc: warning: new shells load nothing until you pick one:");
+            eprintln!("envc:          envc enable <name>");
         }
     }
 
-    println!("deleted profile '{name}' ({})", tildify(&dir));
+    if is_active {
+        Stack::remove()?;
+        notify(quiet, format!("cleared the restore stack ('{name}')"));
+        if !quiet {
+            eprintln!("envc: warning: this shell still holds those variables;");
+            eprintln!("envc:          `envc deactivate` drops them.");
+        }
+    }
+
+    println!("deleted profile '{name}' ({})", Tilde(&dir));
     Ok(())
 }
 
-fn cmd_activate(name: &str, quiet: bool) -> Result<()> {
+fn cmd_activate(name: &str, quiet: bool, shell: Shell) -> Result<()> {
     validate_profile_name(name)?;
 
     let file = profile_env_file(name)?;
     if !file.is_file() {
-        return Err(err(format!(
+        return Err(anyhow!(
             "no such profile: '{name}' (expected {})",
-            tildify(&file)
-        )));
+            Tilde(&file)
+        ));
     }
     let assignments = parse_env_file(&file)?;
 
@@ -1158,7 +1637,7 @@ fn cmd_activate(name: &str, quiet: bool) -> Result<()> {
     // ones the shell had before *any* envc profile was applied.
     let base = match &previous {
         Some(old) => {
-            lines.extend(old.restore_lines());
+            lines.extend(old.restore_lines(shell));
             old.base_env(&current)
         }
         None => current.clone(),
@@ -1166,10 +1645,10 @@ fn cmd_activate(name: &str, quiet: bool) -> Result<()> {
 
     let entries = Stack::entries_from(&base, &assignments);
     for a in &assignments {
-        lines.push(export_line(&a.key, &a.value));
+        lines.push(shell.assign(&a.key, &a.value));
     }
-    lines.push(format!("export ENVC_ACTIVE={}", quote(name)));
-    emit(&lines);
+    lines.push(shell.assign(ENVC_ACTIVE_VAR, name));
+    emit(shell, "activate", &lines)?;
 
     Stack::new(name, entries).save()?;
 
@@ -1179,16 +1658,16 @@ fn cmd_activate(name: &str, quiet: bool) -> Result<()> {
         Some(old) => format!("switched '{}' -> '{name}'", old.profile),
     };
     notify(quiet, format!("{what} ({} vars)", assignments.len()));
-    print_activation_hint(quiet, &format!("envc activate {name}"));
+    print_activation_hint(quiet, &format!("envc activate {name}"), shell);
     Ok(())
 }
 
-fn cmd_deactivate(quiet: bool) -> Result<()> {
+fn cmd_deactivate(quiet: bool, shell: Shell) -> Result<()> {
     match Stack::load()? {
         Some(stack) => {
-            let mut lines = stack.restore_lines();
-            lines.push("unset ENVC_ACTIVE".to_string());
-            emit(&lines);
+            let mut lines = stack.restore_lines(shell);
+            lines.push(shell.unset(ENVC_ACTIVE_VAR));
+            emit(shell, "deactivate", &lines)?;
             Stack::remove()?;
 
             notify(
@@ -1199,11 +1678,11 @@ fn cmd_deactivate(quiet: bool) -> Result<()> {
                     stack.entries.len()
                 ),
             );
-            print_activation_hint(quiet, "envc deactivate");
+            print_activation_hint(quiet, "envc deactivate", shell);
         }
         None => {
             if std::env::var_os("ENVC_ACTIVE").is_some() {
-                emit(&["unset ENVC_ACTIVE".to_string()]);
+                emit(shell, "deactivate", &[shell.unset(ENVC_ACTIVE_VAR)])?;
                 notify(quiet, "nothing on the restore stack; cleared ENVC_ACTIVE only");
             } else {
                 notify(quiet, "no profile is active in this shell");
@@ -1213,21 +1692,22 @@ fn cmd_deactivate(quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Re-apply the selected profile in a fresh shell. Called by the ~/.bashrc hook.
+/// Re-apply the startup profile in a fresh shell. Called by the ~/.bashrc hook.
 ///
 /// Unlike `activate` there is no previous stack to peel off: a new shell starts
 /// from the login environment, which is exactly the base we want to remember.
-fn cmd_autoload() -> Result<()> {
-    let Some(stack) = Stack::load()? else {
+/// The stack written here is only there so `deactivate` can undo the autoload;
+/// what gets loaded is decided by the startup file, never by the stack.
+fn cmd_autoload(shell: Shell) -> Result<()> {
+    let Some(profile) = remembered_startup()? else {
         return Ok(());
     };
 
-    let file = profile_env_file(&stack.profile)?;
+    let file = profile_env_file(&profile)?;
     if !file.is_file() {
         eprintln!(
-            "envc: profile '{}' is selected but {} is missing; skipping autoload",
-            stack.profile,
-            tildify(&file)
+            "envc: startup profile '{profile}' is selected but {} is missing; skipping autoload",
+            Tilde(&file)
         );
         return Ok(());
     }
@@ -1237,80 +1717,190 @@ fn cmd_autoload() -> Result<()> {
 
     let mut lines = Vec::new();
     for a in &assignments {
-        lines.push(export_line(&a.key, &a.value));
+        lines.push(shell.assign(&a.key, &a.value));
     }
-    lines.push(format!("export ENVC_ACTIVE={}", quote(&stack.profile)));
-    emit(&lines);
+    lines.push(shell.assign(ENVC_ACTIVE_VAR, &profile));
+    emit(shell, "autoload", &lines)?;
 
-    Stack::new(&stack.profile, Stack::entries_from(&current, &assignments)).save()?;
+    Stack::new(&profile, Stack::entries_from(&current, &assignments)).save()?;
     Ok(())
 }
 
 /// First-time setup: work out which startup file the login shell reads, then
 /// inject the hook into it unless it is already there.
+#[cfg(not(windows))]
 fn cmd_init(quiet: bool) -> Result<()> {
     let rc = rc_file()?;
     let shell = detect_shell();
     let already = rc_is_enabled()?;
 
-    println!("shell:   {} (from {})", shell.name(), detection_source());
-    println!("rc file: {}", tildify(&rc));
+    println!("shell:   {} ({})", shell.name(), detection_source());
+    println!("rc file: {}", Tilde(&rc));
 
     if already {
-        println!("hook:    already installed, nothing to do");
+        println!("hook:    already installed");
     } else {
         rc_enable()?;
         println!("hook:    installed");
+    }
+
+    match Startup::load()? {
+        Some(s) => println!("profile: {}", s.profile),
+        None => println!("profile: none -- `envc enable <name>` picks one"),
     }
 
     warn_if_not_on_path();
 
     if !already {
         println!();
-        println!("open a new shell, or run `source {}` to use it right now.", tildify(&rc));
+        println!("open a new shell, or `source {}`.", Tilde(&rc));
     }
     if !quiet {
         println!();
-        println!("next:");
-        println!("    envc create work      # write a profile");
-        println!("    envc activate work    # apply it to this shell");
+        println!("next: envc create work, then envc enable work");
     }
     Ok(())
 }
 
-fn cmd_enable() -> Result<()> {
-    let rc = rc_file()?;
-    match rc_enable()? {
-        EnableOutcome::Installed => {
-            println!("startup loading enabled");
-            println!("  installed the hook into {}", tildify(&rc));
-        }
-        EnableOutcome::Refreshed => {
-            println!("startup loading enabled");
-            println!("  refreshed the hook in {}", tildify(&rc));
-        }
+/// Windows has nothing to patch.
+///
+/// cmd and PowerShell each read a different startup file, so there is no single
+/// place to install a hook. `enable` sidesteps that by writing user-level
+/// environment variables instead, which every new process sees regardless of
+/// shell -- so `init` only has to report what is going on.
+#[cfg(windows)]
+fn cmd_init(quiet: bool) -> Result<()> {
+    println!("shell:   {}", Shell::detect().name());
+    println!("startup: user environment (no rc file to patch)");
+
+    match Startup::load()? {
+        Some(s) => println!("profile: {}", s.profile),
+        None => println!("profile: none -- `envc enable <name>` picks one"),
     }
+
+    if !quiet {
+        println!();
+        println!("next: envc create work, then envc enable work");
+        println!();
+        println!("to apply a profile to just this shell:");
+        println!("    cmd        envc activate work && call \"%TEMP%\\envc\\activate.cmd\"");
+        println!("    powershell envc activate work | Invoke-Expression");
+    }
+    Ok(())
+}
+
+/// Choose the profile new shells load and make sure the hook is in place.
+///
+/// This is the startup half of envc: it changes what the *next* shell does and
+/// leaves the current one untouched (`activate` is the other half).
+#[cfg(windows)]
+fn cmd_enable(name: Option<&str>) -> Result<()> {
+    enable_user_env(Startup {
+        profile: resolve_startup_profile(name)?,
+    })
+}
+
+/// POSIX: install (or refresh) the rc hook that loads the profile.
+#[cfg(not(windows))]
+fn cmd_enable(name: Option<&str>) -> Result<()> {
+    // The name is moved into the state and read back out of it, so nothing is
+    // cloned on the way to the messages below.
+    let startup = Startup {
+        profile: resolve_startup_profile(name)?,
+    };
+    startup.save()?;
+    let rc = rc_file()?;
+    let verb = match rc_enable()? {
+        EnableOutcome::Installed => "installed the hook into",
+        EnableOutcome::Refreshed => "refreshed the hook in",
+    };
+
+    println!("startup loading enabled: {}", startup.profile);
+    println!("  {verb} {}", Tilde(&rc));
     println!(
-        "  open a new shell (or run: source {}) to pick it up",
-        tildify(&rc)
+        "  new shells load it; `envc activate {}` for this one",
+        startup.profile
     );
 
     warn_if_not_on_path();
     Ok(())
 }
 
+/// Windows `enable`: make the profile's variables permanent.
+///
+/// There is no rc file that cmd and PowerShell both read, so the variables go
+/// into the user environment instead -- every process started afterwards sees
+/// them, whatever shell it is. What they held before is recorded first, because
+/// `disable` has to be able to put that back.
+#[cfg(windows)]
+fn enable_user_env(startup: Startup) -> Result<()> {
+    let assignments = parse_env_file(&profile_env_file(&startup.profile)?)?;
+    if assignments.is_empty() {
+        return Err(anyhow!("profile '{}' sets no variables", startup.profile));
+    }
+
+    let keys: Vec<&str> = assignments.iter().map(|a| a.key.as_str()).collect();
+    let before = read_user_vars(&keys)?;
+
+    let entries = assignments
+        .iter()
+        .map(|a| Entry {
+            key: a.key.clone(),
+            prev: before.get(&a.key).cloned().flatten(),
+            now: Some(a.value.clone()),
+        })
+        .collect();
+
+    let pairs: Vec<(String, Option<String>)> = assignments
+        .iter()
+        .map(|a| (a.key.clone(), Some(a.value.clone())))
+        .collect();
+
+    write_user_vars(&pairs)?;
+    UserStack(Stack::new(&startup.profile, entries)).save()?;
+    startup.save()?;
+
+    println!("startup loading enabled: {}", startup.profile);
+    println!("  wrote {} variables to your user environment", assignments.len());
+    println!("  new shells and programs see them; this one does not");
+    println!("  `envc disable` puts the previous values back");
+    Ok(())
+}
+
+/// Which profile `enable` should select: the one named on the command line,
+/// else the one already remembered. Either way it has to exist.
+fn resolve_startup_profile(name: Option<&str>) -> Result<String> {
+    let profile = match name {
+        Some(name) => {
+            validate_profile_name(name)?;
+            name.to_string()
+        }
+        None => remembered_startup()?.ok_or_else(|| {
+            anyhow!("no startup profile chosen yet; run `envc enable <name>`".to_string())
+        })?,
+    };
+
+    let file = profile_env_file(&profile)?;
+    if !file.is_file() {
+        return Err(anyhow!(
+            "no such profile: '{profile}' (expected {})",
+            Tilde(&file)
+        ));
+    }
+    Ok(profile)
+}
+
 /// The hook is useless if new shells cannot find the binary, and that is an easy
 /// mistake to make after a plain `cargo build`.
+#[cfg(not(windows))]
 fn warn_if_not_on_path() {
     if binary_on_path() {
         return;
     }
     eprintln!();
-    eprintln!("envc: warning: `envc` is not on PATH, so the hook cannot fire in new shells.");
-    eprintln!("envc:          this binary is {}", current_exe());
-    eprintln!("envc:          install it, for example:");
+    eprintln!("envc: warning: not on PATH, so the hook cannot fire in new shells.");
     eprintln!(
-        "envc:              install -Dm755 {} {}",
+        "envc:          install -Dm755 {} {}",
         current_exe(),
         suggested_install_path()
     );
@@ -1318,6 +1908,7 @@ fn warn_if_not_on_path() {
 
 /// `~/.local/bin` on Linux, `/usr/local/bin` on macOS (where the former is
 /// rarely on PATH).
+#[cfg(not(windows))]
 fn suggested_install_path() -> String {
     let dir = if cfg!(target_os = "macos") {
         PathBuf::from("/usr/local/bin")
@@ -1329,20 +1920,65 @@ fn suggested_install_path() -> String {
     dir.join("envc").display().to_string()
 }
 
+/// Stop new shells from loading anything. The current shell keeps whatever it
+/// has applied, and the chosen profile is remembered for a later `enable`.
+#[cfg(not(windows))]
 fn cmd_disable(quiet: bool) -> Result<()> {
     let rc = rc_file()?;
     if rc_disable()? {
         println!("startup loading disabled");
-        println!("  removed the hook from {}", tildify(&rc));
+        println!("  removed the hook from {}", Tilde(&rc));
+        if let Some(startup) = Startup::load()? {
+            println!(
+                "  '{}' remembered; a bare `envc enable` turns it back on",
+                startup.profile
+            );
+        }
         if !quiet {
-            println!("  the `envc` shell function stays defined until you open a new shell.");
-            println!("  run `envc init` to turn startup loading back on.");
+            println!("  this shell keeps its profile -- `envc deactivate` drops it.");
         }
     } else if !quiet {
         println!(
             "startup loading was already disabled ({} has no hook)",
-            tildify(&rc)
+            Tilde(&rc)
         );
+        println!("  run `envc enable` to turn it back on");
+    }
+    Ok(())
+}
+
+/// Windows `disable`: put the user-level variables back the way they were.
+#[cfg(windows)]
+fn cmd_disable(quiet: bool) -> Result<()> {
+    let Some(user_stack) = UserStack::load()? else {
+        if !quiet {
+            println!("startup loading was already disabled");
+        }
+        return Ok(());
+    };
+
+    // `None` means the variable did not exist at the user level, so this
+    // removes it rather than setting it empty.
+    let pairs: Vec<(String, Option<String>)> = user_stack
+        .0
+        .entries
+        .iter()
+        .map(|e| (e.key.clone(), e.prev.clone()))
+        .collect();
+
+    write_user_vars(&pairs)?;
+    UserStack::remove()?;
+
+    println!("startup loading disabled");
+    println!("  restored {} user variables", pairs.len());
+    if let Some(startup) = Startup::load()? {
+        println!(
+            "  '{}' remembered; a bare `envc enable` turns it back on",
+            startup.profile
+        );
+    }
+    if !quiet {
+        println!("  this shell keeps its profile -- `envc deactivate` drops it.");
     }
     Ok(())
 }
@@ -1353,60 +1989,86 @@ fn cmd_stack() -> Result<()> {
     match Stack::load()? {
         Some(stack) => {
             println!(
-                "{} '{}' is active; {} in the restore stack",
+                "{} '{}' active, {} in the stack",
                 c.bold("envc:"),
                 c.bold(&stack.profile),
                 stack.entries.len()
             );
-            println!("{}", tildify(&path));
+            println!("{}", Tilde(&path));
             println!();
             print!("{}", stack.render());
         }
         None => {
-            println!("no profile is active; {} does not exist", tildify(&path));
+            println!("no profile active; {} is absent", Tilde(&path));
         }
     }
     Ok(())
 }
 
 fn cmd_status() -> Result<()> {
+    let shell = Shell::detect();
     let c = Palette::new();
     let home = envc_home()?;
-    let rc = rc_file()?;
     let stack = Stack::load()?;
     let shell_active = std::env::var("ENVC_ACTIVE").ok();
 
     println!("{} {}", c.bold("envc"), env!("CARGO_PKG_VERSION"));
-    println!("  {:<17}{}", "home", tildify(&home));
+    println!("  {:<17}{}", "home", Tilde(&home));
+    println!("  {:<17}{}", "shell", shell.name());
 
-    let state = if rc_is_enabled()? {
+    let enabled = startup_is_on()?;
+    let state = if enabled {
         c.green("enabled")
     } else {
         c.yellow("disabled")
     };
-    println!("  {:<17}{} ({})", "startup loading", state, tildify(&rc));
+    println!("  {:<17}{} ({})", "startup loading", state, startup_where()?);
 
-    match &stack {
-        Some(s) => println!(
-            "  {:<17}{} ({} vars, restore stack at {})",
-            "selected profile",
-            c.bold(&s.profile),
-            s.entries.len(),
-            tildify(&stack_path()?)
+    // `Startup::load` and not `remembered_startup`: reporting must not migrate.
+    let startup = Startup::load()?.map(|s| s.profile);
+    match (&enabled, &startup) {
+        (true, Some(s)) => println!("  {:<17}{}", "startup profile", c.bold(s)),
+        (true, None) => println!(
+            "  {:<17}{}",
+            "startup profile",
+            c.dim("(none -- `envc enable <name>`)")
         ),
-        None => println!("  {:<17}{}", "selected profile", c.dim("(none)")),
+        (false, Some(s)) => println!(
+            "  {:<17}{} {}",
+            "startup profile",
+            c.bold(s),
+            c.dim("(remembered, loading off)")
+        ),
+        (false, None) => println!("  {:<17}{}", "startup profile", c.dim("(none)")),
     }
 
     match &shell_active {
         Some(name) => println!("  {:<17}{}", "this shell", c.bold(name)),
-        None => println!("  {:<17}(no profile applied)", "this shell"),
+        None => println!("  {:<17}{}", "this shell", c.dim("(none)")),
     }
 
-    if let (Some(sel), Some(cur)) = (stack.as_ref().map(|s| s.profile.clone()), &shell_active) {
-        if &sel != cur {
-            eprintln!();
-            eprintln!("envc: note: this shell has '{cur}' applied but the selected profile is '{sel}'.");
-            eprintln!("envc:       run `envc activate {sel}` here, or `envc deactivate` to clear this shell.");
+    match &stack {
+        Some(s) => println!(
+            "  {:<17}{} vars ({})",
+            "restore stack",
+            s.entries.len(),
+            Tilde(&stack_path()?)
+        ),
+        None => println!("  {:<17}{}", "restore stack", c.dim("(empty)")),
+    }
+
+    // The two halves only disagree when this shell is not showing what the next
+    // shell will load, which is exactly when the user needs to be told.
+    if enabled {
+        if let (Some(startup), Some(cur)) = (&startup, &shell_active) {
+            if startup != cur {
+                eprintln!();
+                eprintln!("envc: note: this shell has '{cur}', new shells load '{startup}'.");
+                eprintln!(
+                    "envc:       `envc activate {startup}` to match, \
+                     `envc enable {cur}` to switch."
+                );
+            }
         }
     }
 
@@ -1418,7 +2080,7 @@ fn cmd_status() -> Result<()> {
                 .count()
         })
         .unwrap_or(0);
-    println!("  {:<17}{} in {}", "profiles", count, tildify(&profiles));
+    println!("  {:<17}{} in {}", "profiles", count, Tilde(&profiles));
     Ok(())
 }
 
@@ -1439,16 +2101,18 @@ fn hint_wanted() -> bool {
 }
 
 /// Printed when shell code was generated but nothing is going to eval it.
-fn print_activation_hint(quiet: bool, command: &str) {
-    if quiet || !hint_wanted() {
+fn print_activation_hint(quiet: bool, command: &str, shell: Shell) {
+    // cmd got a batch file instead of stdout; `emit` already said which one.
+    if quiet || shell == Shell::Cmd || !hint_wanted() {
         return;
     }
     eprintln!();
-    eprintln!("envc: this shell has NOT been changed yet -- the lines above must be evaluated:");
+    eprintln!("envc: this shell is unchanged until you evaluate that:");
     eprintln!("envc:     eval \"$({command})\"");
-    eprintln!("envc: run `envc enable` once to install a wrapper so `{command}` just works.");
+    eprintln!("envc: `envc enable` installs a wrapper so that is not needed.");
 }
 
+#[cfg(not(windows))]
 fn binary_on_path() -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -1456,6 +2120,7 @@ fn binary_on_path() -> bool {
     std::env::split_paths(&path).any(|dir| dir.join("envc").is_file())
 }
 
+#[cfg(not(windows))]
 fn current_exe() -> String {
     std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -1474,29 +2139,34 @@ impl Palette {
         }
     }
 
-    fn paint(&self, code: &str, s: &str) -> String {
+    /// `impl Display` rather than `&str` so callers can pass a `Tilde` (or any
+    /// other lazy wrapper) without materialising a string first.
+    fn paint(&self, code: &str, s: impl fmt::Display) -> String {
         if self.on {
             format!("\x1b[{code}m{s}\x1b[0m")
         } else {
             s.to_string()
         }
     }
+}
 
-    fn bold(&self, s: &str) -> String {
-        self.paint("1", s)
-    }
-    fn dim(&self, s: &str) -> String {
-        self.paint("2", s)
-    }
-    fn green(&self, s: &str) -> String {
-        self.paint("32", s)
-    }
-    fn yellow(&self, s: &str) -> String {
-        self.paint("33", s)
-    }
-    fn red(&self, s: &str) -> String {
-        self.paint("31", s)
-    }
+/// One method per color, so adding a color is a single line.
+macro_rules! palette_colors {
+    ($($name:ident => $code:literal),+ $(,)?) => {
+        impl Palette {
+            $(fn $name(&self, s: impl fmt::Display) -> String {
+                self.paint($code, s)
+            })+
+        }
+    };
+}
+
+palette_colors! {
+    bold => "1",
+    dim => "2",
+    green => "32",
+    yellow => "33",
+    red => "31",
 }
 
 // ===========================================================================
@@ -1516,6 +2186,10 @@ struct Cli {
     /// Suppress informational messages
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Which shell syntax to emit: bash, powershell or cmd
+    #[arg(long, global = true, value_name = "SHELL")]
+    shell: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -1563,10 +2237,13 @@ enum Command {
     /// startup hook into it (safe to re-run)
     Init,
 
-    /// Install the startup hook into the rc file so new shells load the profile
-    Enable,
+    /// Choose the profile new shells load and install the startup hook
+    Enable {
+        /// Profile new shells load; defaults to the one chosen previously
+        name: Option<String>,
+    },
 
-    /// Remove the startup hook from ~/.bashrc
+    /// Stop new shells from loading a profile (this shell is left alone)
     Disable,
 
     /// Show the restore stack that `deactivate` replays
@@ -1582,18 +2259,19 @@ enum Command {
 
 fn run(cli: Cli) -> Result<()> {
     let quiet = cli.quiet;
+    let shell = Shell::resolve(cli.shell.as_deref())?;
     match cli.command {
         Command::Create { name, force } => cmd_create(&name, force),
         Command::List => cmd_list(),
         Command::Delete { name, force } => cmd_delete(&name, force, quiet),
-        Command::Activate { name } => cmd_activate(&name, quiet),
-        Command::Deactivate => cmd_deactivate(quiet),
+        Command::Activate { name } => cmd_activate(&name, quiet, shell),
+        Command::Deactivate => cmd_deactivate(quiet, shell),
         Command::Init => cmd_init(quiet),
-        Command::Enable => cmd_enable(),
+        Command::Enable { name } => cmd_enable(name.as_deref()),
         Command::Disable => cmd_disable(quiet),
         Command::Stack => cmd_stack(),
         Command::Status => cmd_status(),
-        Command::Autoload => cmd_autoload(),
+        Command::Autoload => cmd_autoload(shell),
     }
 }
 
@@ -1602,461 +2280,11 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("envc: {e}");
+            // `{:#}` prints the whole context chain, so a wrapped io::Error
+            // still reads as "cannot read ~/.envc/stack: No such file...".
+            eprintln!("envc: {e:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // -- profile names ------------------------------------------------------
-
-    #[test]
-    fn accepts_reasonable_profile_names() {
-        for name in ["work", "client-a", "rust_1.80", "a"] {
-            assert!(validate_profile_name(name).is_ok(), "{name} should be valid");
-        }
-    }
-
-    #[test]
-    fn rejects_dangerous_profile_names() {
-        for name in ["", "..", "../evil", "/abs", "a/b", ".hidden", "a b", "a$b"] {
-            assert!(
-                validate_profile_name(name).is_err(),
-                "{name:?} should be rejected"
-            );
-        }
-    }
-
-    // -- quoting ------------------------------------------------------------
-
-    #[test]
-    fn quotes_only_when_needed() {
-        assert_eq!(quote("/usr/bin:/bin"), "/usr/bin:/bin");
-        assert_eq!(quote(""), "''");
-        assert_eq!(quote("hello world"), "'hello world'");
-        assert_eq!(quote("a$b"), "'a$b'");
-        assert_eq!(quote("a;rm -rf /"), "'a;rm -rf /'");
-        assert_eq!(quote("it's"), r"'it'\''s'");
-    }
-
-    /// The real contract: whatever `quote` produces, bash must read back as the
-    /// original string. Verified against an actual bash, not by eyeballing.
-    #[test]
-    fn quoted_values_survive_a_real_shell() {
-        let values = [
-            "plain",
-            "",
-            "with spaces",
-            "it's",
-            r#"mixed "quotes" and 'apostrophes'"#,
-            "$HOME",
-            "`whoami`",
-            "a;rm -rf /",
-            "a\nb\tc",
-            "*?[]{}~!#&|<>",
-            "日本語 の 値",
-            "back\\slash",
-        ];
-        for value in values {
-            let script = format!("printf %s {}", quote(value));
-            let out = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(&script)
-                .output()
-                .expect("bash should be available");
-            assert!(out.status.success(), "bash failed for {value:?}");
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                value,
-                "round trip failed for {value:?} (script: {script})"
-            );
-        }
-    }
-
-    #[test]
-    fn recognises_identifiers() {
-        assert!(is_identifier("PATH"));
-        assert!(is_identifier("_x1"));
-        assert!(!is_identifier("1x"));
-        assert!(!is_identifier("a-b"));
-        assert!(!is_identifier(""));
-    }
-
-    // -- .env parsing -------------------------------------------------------
-
-    fn parsed(content: &str) -> Vec<Assignment> {
-        parse_env(content, "test.env").expect("should parse")
-    }
-
-    fn value_of(content: &str, key: &str) -> String {
-        parsed(content)
-            .into_iter()
-            .find(|a| a.key == key)
-            .unwrap_or_else(|| panic!("{key} missing"))
-            .value
-    }
-
-    #[test]
-    fn parses_plain_assignments() {
-        let a = parsed("A=1\nB=two\n");
-        assert_eq!(a[0], Assignment { key: "A".into(), value: "1".into() });
-        assert_eq!(a[1], Assignment { key: "B".into(), value: "two".into() });
-    }
-
-    #[test]
-    fn skips_blanks_and_comments() {
-        assert_eq!(parsed("\n# a comment\n   \nA=1\n   # indented comment\n").len(), 1);
-    }
-
-    #[test]
-    fn export_prefix_is_optional() {
-        assert_eq!(value_of("export A=1\n", "A"), "1");
-        assert_eq!(value_of("export\tA=1\n", "A"), "1");
-        // `exportFOO=1` declares a variable named exportFOO, not an export.
-        assert_eq!(value_of("exportFOO=1\n", "exportFOO"), "1");
-    }
-
-    #[test]
-    fn handles_quoting() {
-        assert_eq!(value_of("A=\"a b\"\n", "A"), "a b");
-        assert_eq!(value_of("A='a b'\n", "A"), "a b");
-        assert_eq!(value_of("A=\"a \"\n", "A"), "a ");
-        assert_eq!(value_of("A='$HOME'\n", "A"), "$HOME");
-    }
-
-    #[test]
-    fn trims_unquoted_trailing_space_but_keeps_quoted() {
-        assert_eq!(value_of("A=abc   \n", "A"), "abc");
-        assert_eq!(value_of("A=\"abc   \"\n", "A"), "abc   ");
-        assert_eq!(value_of("A=abc \"  \"\n", "A"), "abc   ");
-    }
-
-    #[test]
-    fn inline_comments_only_after_whitespace() {
-        assert_eq!(value_of("A=abc # note\n", "A"), "abc");
-        assert_eq!(value_of("A=abc#notacomment\n", "A"), "abc#notacomment");
-        assert_eq!(value_of("A=\"a # b\"\n", "A"), "a # b");
-    }
-
-    #[test]
-    fn expands_keys_defined_earlier_in_the_same_file() {
-        assert_eq!(value_of("ROOT=/opt\nBIN=$ROOT/bin\n", "BIN"), "/opt/bin");
-        assert_eq!(value_of("ROOT=/opt\nBIN=${ROOT}/bin\n", "BIN"), "/opt/bin");
-    }
-
-    #[test]
-    fn expands_the_process_environment() {
-        let home = std::env::var("HOME").expect("HOME should be set on linux");
-        assert_eq!(value_of("A=$HOME!\n", "A"), format!("{home}!"));
-        assert_eq!(value_of("A=${HOME}\n", "A"), home);
-    }
-
-    #[test]
-    fn unset_variables_expand_to_empty_or_their_default() {
-        assert_eq!(value_of("A=$ENVC_UNSET_XYZ\n", "A"), "");
-        assert_eq!(value_of("A=${ENVC_UNSET_XYZ:-fallback}\n", "A"), "fallback");
-        assert_eq!(value_of("A=${ENVC_UNSET_XYZ-fallback}\n", "A"), "fallback");
-        assert_eq!(value_of("A=${ENVC_UNSET_XYZ:-$HOME}\n", "A"), std::env::var("HOME").unwrap());
-        assert_eq!(value_of("A=${ENVC_UNSET_XYZ:-${ENVC_UNSET_ABC:-deep}}\n", "A"), "deep");
-    }
-
-    #[test]
-    fn a_dollar_that_starts_no_expansion_stays_literal() {
-        assert_eq!(value_of("A=price$\n", "A"), "price$");
-        assert_eq!(value_of("A='$'\n", "A"), "$");
-        assert_eq!(value_of("A=\\$HOME\n", "A"), "$HOME");
-        assert_eq!(value_of("A=$1\n", "A"), "$1");
-    }
-
-    #[test]
-    fn reports_the_offending_line() {
-        let e = parse_env("A=1\nnot an assignment\n", "x.env").unwrap_err();
-        assert!(e.to_string().contains("x.env:2"), "{e}");
-    }
-
-    #[test]
-    fn rejects_bad_keys_in_an_env_file() {
-        assert!(parse_env("1BAD=1\n", "x.env").is_err());
-        assert!(parse_env("A-B=1\n", "x.env").is_err());
-    }
-
-    // -- restore stack ------------------------------------------------------
-
-    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-    }
-
-    fn sample_stack() -> Stack {
-        Stack::new(
-            "work",
-            vec![
-                Entry { key: "EDITOR".into(), prev: Some("nano".into()), now: Some("vim".into()) },
-                Entry { key: "TOKEN".into(), prev: None, now: Some("abc".into()) },
-            ],
-        )
-    }
-
-    #[test]
-    fn renders_a_diff_shaped_file() {
-        assert_eq!(
-            sample_stack().render(),
-            "\
-# envc restore stack -- written by `envc activate`, replayed by `envc deactivate`.
-#
-# A '-' line is what the shell held before the profile was applied, the
-# '+' line under it is what the profile installed. A line with no `=value`
-# means the variable was not set at all, so undoing it means `unset`.
-#
-# format 1
-# active-profile work
---- before envc
-+++ after `work`
--EDITOR=nano
-+EDITOR=vim
--TOKEN
-+TOKEN=abc
-"
-        );
-    }
-
-    #[test]
-    fn stack_round_trips_through_its_text_format() {
-        for stack in [
-            sample_stack(),
-            Stack::new("empty", vec![]),
-            Stack::new(
-                "odd",
-                vec![
-                    Entry { key: "A".into(), prev: None, now: None },
-                    Entry { key: "B".into(), prev: Some(String::new()), now: Some("x=y=z".into()) },
-                    Entry { key: "C".into(), prev: Some("a\nb".into()), now: Some("c\\d".into()) },
-                    Entry { key: "D".into(), prev: Some("+minus".into()), now: Some("-plus".into()) },
-                ],
-            ),
-        ] {
-            let parsed = parse_stack(&stack.render(), "stack").expect("should parse");
-            assert_eq!(parsed.profile, stack.profile);
-            assert_eq!(parsed.entries, stack.entries);
-        }
-    }
-
-    #[test]
-    fn restores_previous_values_and_unsets_new_ones() {
-        // Reverse order: TOKEN is unset before EDITOR is restored.
-        assert_eq!(
-            sample_stack().restore_lines(),
-            vec!["unset TOKEN".to_string(), "export EDITOR=nano".to_string()]
-        );
-    }
-
-    #[test]
-    fn an_empty_previous_value_restores_to_empty_not_unset() {
-        let stack = Stack::new(
-            "p",
-            vec![Entry { key: "A".into(), prev: Some(String::new()), now: Some("x".into()) }],
-        );
-        assert_eq!(stack.restore_lines(), vec!["export A=''".to_string()]);
-    }
-
-    #[test]
-    fn base_env_peels_the_stack_off() {
-        let stack = Stack::new(
-            "work",
-            vec![
-                Entry { key: "EDITOR".into(), prev: Some("nano".into()), now: Some("vim".into()) },
-                Entry { key: "TOKEN".into(), prev: None, now: Some("abc".into()) },
-                Entry { key: "PATH".into(), prev: Some("/usr/bin".into()), now: Some("/opt/bin".into()) },
-            ],
-        );
-        let current = env(&[
-            ("EDITOR", "vim"),
-            ("TOKEN", "abc"),
-            ("PATH", "/opt/bin"),
-            ("HOME", "/root"),
-        ]);
-
-        let base = stack.base_env(&current);
-        assert_eq!(base.get("EDITOR").map(String::as_str), Some("nano"));
-        assert_eq!(base.get("PATH").map(String::as_str), Some("/usr/bin"));
-        assert_eq!(base.get("TOKEN"), None, "a var the profile introduced is removed");
-        assert_eq!(base.get("HOME").map(String::as_str), Some("/root"), "untouched vars survive");
-    }
-
-    /// Switching profiles must remember the *original* values, not the ones the
-    /// first profile installed -- otherwise A -> B -> deactivate lands on A.
-    #[test]
-    fn switching_profiles_keeps_the_original_base() {
-        let base = env(&[("EDITOR", "nano")]);
-        let a_assignments = [Assignment { key: "EDITOR".into(), value: "vim".into() }];
-
-        // activate A: EDITOR -> vim
-        let a = Stack::new("A", Stack::entries_from(&base, &a_assignments));
-        assert_eq!(a.entries[0].prev.as_deref(), Some("nano"));
-
-        // activate B: peel A off, then capture against the peeled base
-        let after_a = env(&[("EDITOR", "vim")]);
-        let peeled = a.base_env(&after_a);
-        assert_eq!(peeled.get("EDITOR").map(String::as_str), Some("nano"));
-
-        let b_assignments = [Assignment { key: "EDITOR".into(), value: "emacs".into() }];
-        let b = Stack::new("B", Stack::entries_from(&peeled, &b_assignments));
-        assert_eq!(b.entries[0].prev.as_deref(), Some("nano"), "B must roll back to the base");
-        assert_eq!(b.restore_lines(), vec!["export EDITOR=nano".to_string()]);
-    }
-
-    #[test]
-    fn rejects_a_corrupt_stack() {
-        assert!(parse_stack("total nonsense\n", "stack").is_err(), "unknown line");
-        assert!(parse_stack("-A=1\n", "stack").is_err(), "dangling '-' line");
-        assert!(parse_stack("+A=1\n", "stack").is_err(), "orphan '+' line");
-        assert!(parse_stack("-A=1\n+B=2\n", "stack").is_err(), "mismatched pair");
-        assert!(parse_stack("-1BAD=1\n+1BAD=2\n", "stack").is_err(), "bad key");
-        assert!(parse_stack("# format 99\n-A=1\n+A=2\n", "stack").is_err(), "future format");
-        assert!(parse_stack("-A=1\n+A=2\n", "stack").is_err(), "no profile header");
-    }
-
-    #[test]
-    fn escape_round_trips() {
-        for value in ["plain", "", "a\nb", "back\\slash", "trailing\\", "a\rb", "混\n合"] {
-            assert_eq!(unescape_value(&escape_value(value)), value, "{value:?}");
-        }
-    }
-
-    // -- bashrc hook --------------------------------------------------------
-
-    #[test]
-    fn strip_block_removes_the_block_and_its_blank_separator() {
-        let content = format!("before\n{}after\n", hook_block());
-        let (out, found) = strip_block(&content);
-        assert!(found);
-        assert_eq!(out, "before\nafter\n");
-    }
-
-    #[test]
-    fn strip_block_on_a_file_without_the_hook_is_a_no_op() {
-        let (out, found) = strip_block("nothing here\n");
-        assert!(!found);
-        assert_eq!(out, "nothing here\n");
-    }
-
-    #[test]
-    fn enable_is_idempotent() {
-        let original = "export PATH=$HOME/bin:$PATH\nalias ll='ls -l'\n";
-
-        let once = format!("{original}{}", hook_block());
-        let (stripped, had) = strip_block(&once);
-        assert!(had);
-        assert_eq!(stripped, original, "removing the hook restores the original file");
-
-        let twice = format!("{stripped}{}", hook_block());
-        assert_eq!(once, twice, "a second enable must not stack up blocks");
-    }
-
-    #[test]
-    fn hook_defines_the_wrapper_and_calls_autoload() {
-        let script = hook_block();
-        assert!(script.contains("envc()"));
-        assert!(script.contains("envc autoload"));
-        assert!(script.contains("ENVC_WRAPPED=1"));
-    }
-
-    // -- clap wiring --------------------------------------------------------
-
-    #[test]
-    fn cli_definition_is_valid() {
-        use clap::CommandFactory;
-        Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn aliases_resolve() {
-        let use_cli = Cli::try_parse_from(["envc", "use", "work"]).expect("`use work` parses");
-        assert!(matches!(use_cli.command, Command::Activate { .. }));
-
-        for alias in ["de", "unuse"] {
-            let cli = Cli::try_parse_from(["envc", alias]).expect("alias parses");
-            assert!(matches!(cli.command, Command::Deactivate), "{alias}");
-        }
-        let ls = Cli::try_parse_from(["envc", "ls"]).expect("`ls` parses");
-        assert!(matches!(ls.command, Command::List));
-        let rm = Cli::try_parse_from(["envc", "rm", "work"]).expect("`rm work` parses");
-        assert!(matches!(rm.command, Command::Delete { .. }));
-    }
-
-    // -- shell detection ----------------------------------------------------
-
-    fn cloned_without_shell<T>(f: impl FnOnce() -> T) -> T {
-        // The tests run in one process, so `$SHELL` has to be restored.
-        let saved = std::env::var_os("SHELL");
-        std::env::remove_var("SHELL");
-        let out = f();
-        match saved {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
-        out
-    }
-
-    #[test]
-    fn falls_back_to_the_os_default_when_shell_is_unset() {
-        let kind = cloned_without_shell(detect_shell);
-        assert_eq!(kind, ShellKind::default_for_os());
-        // macOS has shipped zsh since Catalina; Linux is bash.
-        if cfg!(target_os = "macos") {
-            assert_eq!(kind.rc_name(), ".zshrc");
-        } else {
-            assert_eq!(kind.rc_name(), ".bashrc");
-        }
-    }
-
-    #[test]
-    fn maps_rc_names_to_shells() {
-        assert_eq!(ShellKind::Bash.rc_name(), ".bashrc");
-        assert_eq!(ShellKind::Zsh.rc_name(), ".zshrc");
-        assert_eq!(ShellKind::Bash.name(), "bash");
-        assert_eq!(ShellKind::Zsh.name(), "zsh");
-    }
-
-    /// The hook is written once and has to work in both shells.
-    #[test]
-    fn generated_hook_is_valid_posix_shell_syntax() {
-        let script = hook_block();
-        for shell in ["bash", "zsh", "dash"] {
-            let available = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("command -v {shell}"))
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !available {
-                continue;
-            }
-            let out = std::process::Command::new(shell)
-                .arg("-n")
-                .arg("-c")
-                .arg(&script)
-                .output()
-                .expect("shell should run");
-            assert!(
-                out.status.success(),
-                "{shell} rejected the generated hook:\n{}\n{script}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-
-    #[test]
-    fn quiet_is_accepted_before_and_after_the_subcommand() {
-        assert!(Cli::try_parse_from(["envc", "-q", "list"]).unwrap().quiet);
-        assert!(Cli::try_parse_from(["envc", "list", "--quiet"]).unwrap().quiet);
-        assert!(!Cli::try_parse_from(["envc", "list"]).unwrap().quiet);
-    }
-}
