@@ -40,10 +40,10 @@ chmod +x ~/.local/bin/envc
 envc init
 ```
 
-要固定版本，把 `latest/download/<名字>` 换成 `download/v0.2.0/envc-v0.2.0-<target>`，例如：
+要固定版本，把 `latest/download/<名字>` 换成 `download/v0.2.1/envc-v0.2.1-<target>`，例如：
 
 ```bash
-curl -fsSL -o ~/.local/bin/envc https://github.com/Jabberwocky238/envc/releases/download/v0.2.0/envc-v0.2.0-x86_64-unknown-linux-gnu
+curl -fsSL -o ~/.local/bin/envc https://github.com/Jabberwocky238/envc/releases/download/v0.2.1/envc-v0.2.1-x86_64-unknown-linux-gnu
 ```
 
 ### 中国大陆加速

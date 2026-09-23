@@ -25,10 +25,12 @@
 //! profile in every new shell.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use anyhow::{anyhow, Context as _};
 use clap::{Parser, Subcommand};
@@ -98,31 +100,148 @@ ENVIRONMENT:
 type Result<T> = anyhow::Result<T>;
 
 // ===========================================================================
+// The environment, read once
+// ===========================================================================
+
+/// Everything envc reads out of the environment, snapshotted on first use.
+///
+/// A process's environment cannot change under it, so looking the same variable
+/// up again for every caller is wasted work -- `Tilde` was reading $HOME once
+/// per formatted path, inside `list`'s loop. One snapshot also turns "what does
+/// envc read from the environment?" into a single question with a single answer,
+/// which is worth having in a program whose whole job is environment variables.
+///
+/// Two reads stay outside on purpose: command-line arguments are clap's, and
+/// the terminal check is not an environment variable at all.
+// A few fields only matter on one platform (the login shell, the rc file) --
+// this is the whole environment surface, so gating each one would be noise.
+#[cfg_attr(windows, allow(dead_code))]
+struct Env {
+    /// The whole environment, which is the base profile values expand against
+    /// and what `activate` records for `deactivate` to replay.
+    vars: HashMap<String, String>,
+
+    /// Where `~/.envc` lives. `ENVC_HOME` overrides the default.
+    envc_home: Option<PathBuf>,
+    /// The home directory, and the names that were looked for, so the error can
+    /// name them.
+    home: Option<PathBuf>,
+    home_keys: &'static [&'static str],
+    /// The rc file `init` / `enable` / `disable` patch: `ENVC_RC` (or the legacy
+    /// `ENVC_BASHRC`), else the login shell's file under $HOME.
+    #[cfg(not(windows))]
+    rc: Option<PathBuf>,
+
+    /// `$SHELL`, which says which rc file belongs to the login shell.
+    login_shell: Option<String>,
+    /// `ENVC_SHELL`, and whether PowerShell left PSModulePath behind. Both feed
+    /// the choice of which syntax to emit.
+    envc_shell: Option<String>,
+    ps_module_path: bool,
+
+    /// `SystemRoot`, to find the built-in PowerShell when PATH does not.
+    /// Windows only; nothing on POSIX looks at it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    system_root: Option<PathBuf>,
+    /// Where the cmd hand-off script goes.
+    temp_dir: PathBuf,
+
+    /// `ENVC_ACTIVE` -- the profile this shell has applied.
+    active: Option<String>,
+    /// `ENVC_WRAPPED` -- set by the shell wrapper while it is capturing output.
+    wrapped: bool,
+    /// `NO_COLOR` -- and whether stdout is a terminal, which is not an
+    /// environment variable but is the other half of the same decision.
+    no_color: bool,
+    /// `PATH`, for the "is envc on PATH?" check.
+    path: Option<OsString>,
+}
+
+impl Env {
+    fn read() -> Env {
+        /// An environment variable, treating empty as unset -- which is what
+        /// every caller here wants.
+        fn var(key: &str) -> Option<String> {
+            std::env::var(key).ok().filter(|v| !v.is_empty())
+        }
+        fn path(key: &str) -> Option<PathBuf> {
+            std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+        }
+
+        // Windows sets USERPROFILE (and, in shells that emulate POSIX, HOME);
+        // POSIX shells set HOME. Accepting both keeps `envc` usable from
+        // git-bash too.
+        let home_keys: &[&str] = if cfg!(windows) {
+            &["HOME", "USERPROFILE"]
+        } else {
+            &["HOME"]
+        };
+        let home = home_keys.iter().find_map(|k| path(k));
+        let login_shell = var("SHELL");
+        // Worked out before the literal below, which moves `home` into it.
+        let envc_home = path("ENVC_HOME").or_else(|| home.as_ref().map(|h| h.join(".envc")));
+
+        // The rc file is a POSIX idea; Windows has none to point at.
+        #[cfg(not(windows))]
+        let rc = ["ENVC_RC", "ENVC_BASHRC"]
+            .iter()
+            .find_map(|k| path(k))
+            .or_else(|| {
+                // `shell_kind` and not `detect_shell`: the latter reads this
+                // snapshot, and reading it from inside its own initialiser
+                // would deadlock on the `LazyLock`.
+                home.as_ref()
+                    .map(|h| h.join(shell_kind(login_shell.as_deref()).rc_name()))
+            });
+
+        Env {
+            vars: std::env::vars().collect(),
+            envc_home,
+            home,
+            home_keys,
+            #[cfg(not(windows))]
+            rc,
+            login_shell,
+            envc_shell: var("ENVC_SHELL"),
+            ps_module_path: std::env::var_os("PSModulePath").is_some(),
+            system_root: path("SystemRoot"),
+            temp_dir: std::env::temp_dir(),
+            active: var("ENVC_ACTIVE"),
+            wrapped: var("ENVC_WRAPPED").as_deref() == Some("1"),
+            // Set-and-empty still counts: that is what the NO_COLOR
+            // convention says, so this one does not filter empties.
+            no_color: std::env::var_os("NO_COLOR").is_some(),
+            path: std::env::var_os("PATH"),
+        }
+    }
+
+    /// The snapshot. Initialised on first use, once.
+    fn get() -> &'static Env {
+        static ENV: LazyLock<Env> = LazyLock::new(Env::read);
+        &ENV
+    }
+}
+
+// ===========================================================================
 // Paths
 // ===========================================================================
 
-/// Windows sets USERPROFILE (and, in shells that emulate POSIX, HOME); POSIX
-/// shells set HOME. Accepting both keeps `envc` usable from git-bash too.
-fn home_dir() -> Result<PathBuf> {
-    let names: &[&str] = if cfg!(windows) {
-        &["HOME", "USERPROFILE"]
-    } else {
-        &["HOME"]
-    };
-    for name in names {
-        if let Some(h) = std::env::var_os(name).filter(|h| !h.is_empty()) {
-            return Ok(PathBuf::from(h));
-        }
-    }
-    Err(anyhow!("{} is not set", names.join(" / ")))
+/// What to say when a directory cannot be worked out, naming the variables that
+/// were looked for.
+fn not_set() -> anyhow::Error {
+    anyhow!("{} is not set", Env::get().home_keys.join(" / "))
+}
+
+/// The home directory. Only the POSIX install hint wants it directly; every
+/// other path goes through the snapshot.
+#[cfg(not(windows))]
+fn home_dir() -> Result<&'static Path> {
+    Env::get().home.as_deref().ok_or_else(not_set)
 }
 
 /// Root of everything envc manages. `ENVC_HOME` overrides it (tests use this).
-fn envc_home() -> Result<PathBuf> {
-    match std::env::var_os("ENVC_HOME") {
-        Some(h) if !h.is_empty() => Ok(PathBuf::from(h)),
-        _ => Ok(home_dir()?.join(".envc")),
-    }
+fn envc_home() -> Result<&'static Path> {
+    Env::get().envc_home.as_deref().ok_or_else(not_set)
 }
 
 fn profiles_dir() -> Result<PathBuf> {
@@ -196,12 +315,12 @@ impl ShellKind {
     }
 }
 
-/// Guess the login shell from `$SHELL`, falling back to the OS default. The rc
-/// file belongs to the login shell, not to whatever shell runs `envc`.
+/// Which shell a `$SHELL` value means. Kept pure so the snapshot can call it
+/// while it is still being built.
 #[cfg(not(windows))]
-fn detect_shell() -> ShellKind {
-    if let Some(shell) = std::env::var_os("SHELL") {
-        let name = Path::new(&shell)
+fn shell_kind(shell: Option<&str>) -> ShellKind {
+    if let Some(name) = shell {
+        let name = Path::new(name)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
@@ -216,12 +335,19 @@ fn detect_shell() -> ShellKind {
     ShellKind::default_for_os()
 }
 
+/// The login shell's kind. The rc file belongs to the login shell, not to
+/// whatever shell runs `envc`.
+#[cfg(not(windows))]
+fn detect_shell() -> ShellKind {
+    shell_kind(Env::get().login_shell.as_deref())
+}
+
 /// Where the detection came from, for the `init` report.
 #[cfg(not(windows))]
 fn detection_source() -> String {
-    match std::env::var("SHELL") {
-        Ok(s) if !s.is_empty() => format!("$SHELL={s}"),
-        _ => format!("the {} default", std::env::consts::OS),
+    match Env::get().login_shell.as_deref() {
+        Some(shell) => format!("$SHELL={shell}"),
+        None => format!("the {} default", std::env::consts::OS),
     }
 }
 
@@ -230,15 +356,8 @@ fn detection_source() -> String {
 /// `ENVC_RC` overrides the detection; `ENVC_BASHRC` is accepted as a legacy
 /// alias for it.
 #[cfg(not(windows))]
-fn rc_file() -> Result<PathBuf> {
-    for var in ["ENVC_RC", "ENVC_BASHRC"] {
-        if let Some(p) = std::env::var_os(var) {
-            if !p.is_empty() {
-                return Ok(PathBuf::from(p));
-            }
-        }
-    }
-    Ok(home_dir()?.join(detect_shell().rc_name()))
+fn rc_file() -> Result<&'static Path> {
+    Env::get().rc.as_deref().ok_or_else(not_set)
 }
 
 /// Profile names become directory names, so keep them boring: no separators,
@@ -279,10 +398,10 @@ impl<'a> From<&'a Path> for Tilde<'a> {
 
 impl fmt::Display for Tilde<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Compared against the raw HOME rather than `home_dir()`, which would
-        // allocate a PathBuf on every single formatting.
-        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
-        if let Some(rest) = home
+        // From the snapshot: this runs once per formatted path, inside
+        // `list`'s loop, so it must not be reading anything.
+        if let Some(rest) = Env::get()
+            .home
             .as_deref()
             .and_then(|home| self.0.strip_prefix(home).ok())
         {
@@ -358,11 +477,9 @@ impl Shell {
 
     /// `--shell` / `ENVC_SHELL`, else guess.
     fn resolve(flag: Option<&str>) -> Result<Self> {
-        let wanted = flag.map(str::to_string).or_else(|| {
-            std::env::var("ENVC_SHELL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        });
+        let wanted = flag
+            .map(str::to_string)
+            .or_else(|| Env::get().envc_shell.clone());
 
         match wanted.as_deref().map(str::trim) {
             None => Ok(Shell::detect()),
@@ -380,7 +497,7 @@ impl Shell {
     /// signal available from inside the child.
     fn detect() -> Self {
         if cfg!(windows) {
-            if std::env::var_os("PSModulePath").is_some() {
+            if Env::get().ps_module_path {
                 Shell::PowerShell
             } else {
                 Shell::Cmd
@@ -426,38 +543,55 @@ fn is_identifier(s: &str) -> bool {
 /// `call` it. The file name is fixed, so the idiom can be written down once:
 ///
 ///     envc activate work && call "%TEMP%\envc\activate.cmd"
-fn emit(shell: Shell, what: &str, lines: &[String]) -> Result<()> {
-    if shell != Shell::Cmd {
-        // Write errors are ignored: a closed pipe (`envc list | head`) is not
-        // worth reporting.
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        for line in lines {
-            let _ = writeln!(out, "{line}");
+impl Shell {
+    /// Hand generated code to whoever asked for it.
+    ///
+    /// POSIX shells and PowerShell evaluate what lands on stdout. cmd cannot --
+    /// there is no `eval` -- so its code goes into a batch file instead and the
+    /// caller is told to `call` it. Which of those applies is the shell's
+    /// business, which is why the commands just call this.
+    fn deliver(self, what: &str, lines: &[String]) -> Result<()> {
+        match self {
+            Shell::Cmd => self.write_batch(what, lines),
+            _ => {
+                // Write errors are ignored: a closed pipe (`envc list | head`)
+                // is not worth reporting.
+                let stdout = io::stdout();
+                let mut out = stdout.lock();
+                for line in lines {
+                    let _ = writeln!(out, "{line}");
+                }
+                Ok(())
+            }
         }
-        return Ok(());
     }
 
-    let path = batch_path(what)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", Tilde(dir)))?;
+    /// Whether the caller has to evaluate something before this shell changes.
+    /// cmd does not: it gets a file to `call`, and `write_batch` says where.
+    fn evaluates_stdout(self) -> bool {
+        self != Shell::Cmd
     }
-    // cmd wants CRLF, and a batch file starts with echo off or every line shows.
-    let mut body = String::from("@echo off\r\n");
-    for line in lines {
-        body.push_str(line);
-        body.push_str("\r\n");
+
+    /// The cmd detour: `%TEMP%\envc\<what>.cmd`, which the caller then `call`s.
+    fn write_batch(self, what: &str, lines: &[String]) -> Result<()> {
+        let path = Env::get().temp_dir.join("envc").join(format!("{what}.cmd"));
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", Tilde(dir)))?;
+        }
+        // cmd wants CRLF, and a batch file starts with echo off or every line
+        // it runs gets echoed.
+        let mut body = String::from("@echo off\r\n");
+        for line in lines {
+            body.push_str(line);
+            body.push_str("\r\n");
+        }
+        std::fs::write(&path, body).with_context(|| format!("cannot write {}", Tilde(&path)))?;
+
+        eprintln!("envc: wrote {}", Tilde(&path));
+        eprintln!("envc: in cmd, run: call \"{}\"", path.display());
+        Ok(())
     }
-    std::fs::write(&path, body).with_context(|| format!("cannot write {}", Tilde(&path)))?;
-
-    eprintln!("envc: wrote {}", Tilde(&path));
-    eprintln!("envc: in cmd, run: call \"{}\"", path.display());
-    Ok(())
-}
-
-/// `%TEMP%\envc\<what>.cmd` -- the hand-off file for cmd.
-fn batch_path(what: &str) -> Result<PathBuf> {
-    Ok(std::env::temp_dir().join("envc").join(format!("{what}.cmd")))
 }
 
 // ===========================================================================
@@ -486,7 +620,9 @@ fn parse_env_file(path: &Path) -> Result<Vec<Assignment>> {
 /// BIN=$ROOT/bin     # -> /opt/app/bin
 /// ```
 fn parse_env(content: &str, origin: impl fmt::Display) -> Result<Vec<Assignment>> {
-    let mut env: HashMap<String, String> = std::env::vars().collect();
+    // A copy of the snapshot, because assignments made along the way have to
+    // be visible to the lines below them.
+    let mut env = Env::get().vars.clone();
     let mut out = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
@@ -1033,10 +1169,8 @@ fn powershell(script: &str) -> Result<String> {
     // otherwise fail with something unhelpful, so fall back to where the
     // built-in 5.1 interpreter always lives.
     let mut candidates = vec![PathBuf::from("powershell")];
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        candidates.push(
-            Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
-        );
+    if let Some(root) = &Env::get().system_root {
+        candidates.push(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
     }
 
     let mut spawn_error = None;
@@ -1328,7 +1462,7 @@ fn read_if_exists(path: &Path) -> Result<String> {
 
 #[cfg(not(windows))]
 fn rc_is_enabled() -> Result<bool> {
-    let content = read_if_exists(&rc_file()?)?;
+    let content = read_if_exists(rc_file()?)?;
     Ok(content.contains(BEGIN_MARKER))
 }
 
@@ -1344,14 +1478,14 @@ enum EnableOutcome {
 #[cfg(not(windows))]
 fn rc_enable() -> Result<EnableOutcome> {
     let path = rc_file()?;
-    let content = read_if_exists(&path)?;
+    let content = read_if_exists(path)?;
     let (mut updated, had_block) = strip_block(&content);
 
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
     updated.push_str(&hook_block());
-    std::fs::write(&path, updated).with_context(|| format!("cannot write {}", Tilde(&path)))?;
+    std::fs::write(path, updated).with_context(|| format!("cannot write {}", Tilde(path)))?;
 
     Ok(if had_block {
         EnableOutcome::Refreshed
@@ -1364,10 +1498,10 @@ fn rc_enable() -> Result<EnableOutcome> {
 #[cfg(not(windows))]
 fn rc_disable() -> Result<bool> {
     let path = rc_file()?;
-    let content = read_if_exists(&path)?;
+    let content = read_if_exists(path)?;
     let (stripped, had_block) = strip_block(&content);
     if had_block {
-        std::fs::write(&path, stripped).with_context(|| format!("cannot write {}", Tilde(&path)))?;
+        std::fs::write(path, stripped).with_context(|| format!("cannot write {}", Tilde(path)))?;
     }
     Ok(had_block)
 }
@@ -1433,7 +1567,7 @@ fn cmd_create(name: &str, force: bool) -> Result<()> {
     println!("  env file: {}", Tilde(&file));
     println!("  edit it, then run: envc activate {name}");
 
-    if !startup_is_on()? {
+    if !layer().is_on()? {
         println!();
         println!("note: startup loading is off, so new shells will not load this profile.");
         println!("      run `envc enable {name}` to turn it on.");
@@ -1531,40 +1665,247 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-/// Is startup loading on?
+// ---------------------------------------------------------------------------
+// Startup loading: the platform's half
+// ---------------------------------------------------------------------------
+
+/// What "startup loading" means on this platform.
 ///
-/// POSIX shells read the hook in the rc file; Windows has no such file, so the
-/// equivalent evidence is that the user-level variables are currently applied.
-#[cfg(not(windows))]
-fn startup_is_on() -> Result<bool> {
-    rc_is_enabled()
+/// POSIX shells read an rc file, so `apply` installs a hook into it. Windows has
+/// no rc file that both cmd and PowerShell read, so `apply` puts the profile's
+/// variables into the user environment instead and `revert` hands back what they
+/// held before. Choosing the profile, remembering it and reporting on it are the
+/// same either way -- which is why the commands no longer say which platform
+/// they are running on.
+trait Layer {
+    /// Make the mechanism ready and describe it, for `init`. POSIX installs the
+    /// hook here; Windows has nothing to install.
+    fn prepare(&self) -> Result<Vec<String>>;
+
+    /// Where startup loading lives, for `status` and `list`.
+    fn describe(&self) -> Result<String>;
+
+    /// Whether it is on right now.
+    fn is_on(&self) -> Result<bool>;
+
+    /// Turn it on for `profile`, describing what that did.
+    fn apply(&self, profile: &str) -> Result<String>;
+
+    /// Turn it off. `None` when it was already off, else what was undone.
+    fn revert(&self) -> Result<Option<String>>;
+
+    /// The line for "it was already off"; POSIX can name the file, Windows
+    /// does not have one.
+    fn already_off(&self) -> String;
+
+    /// What switching it on means for the shell in front of the user.
+    fn applied_hint(&self, profile: &str) -> Vec<String>;
+
+    /// Trailing advice for `init`.
+    fn advice(&self, already_on: bool, quiet: bool) -> Result<Vec<String>>;
+
+    /// Complain about anything that would stop this working.
+    fn check_environment(&self);
 }
+
+/// This platform's layer. The only place the platform is named.
+fn layer() -> &'static dyn Layer {
+    #[cfg(windows)]
+    {
+        &Windows
+    }
+    #[cfg(not(windows))]
+    {
+        &Posix
+    }
+}
+
+/// POSIX: a hook in the login shell's rc file.
+#[cfg(not(windows))]
+struct Posix;
+
+#[cfg(not(windows))]
+impl Layer for Posix {
+    fn prepare(&self) -> Result<Vec<String>> {
+        let rc = rc_file()?;
+        let already = rc_is_enabled()?;
+        if !already {
+            rc_enable()?;
+        }
+        Ok(vec![
+            format!("shell:   {} ({})", detect_shell().name(), detection_source()),
+            format!("rc file: {}", Tilde(rc)),
+            format!(
+                "hook:    {}",
+                if already { "already installed" } else { "installed" }
+            ),
+        ])
+    }
+
+    fn describe(&self) -> Result<String> {
+        Ok(Tilde(rc_file()?).to_string())
+    }
+
+    fn is_on(&self) -> Result<bool> {
+        rc_is_enabled()
+    }
+
+    fn apply(&self, _profile: &str) -> Result<String> {
+        // The hook loads whatever ~/.envc/startup points at, so none of this
+        // depends on which profile it is.
+        let rc = rc_file()?;
+        Ok(match rc_enable()? {
+            EnableOutcome::Installed => format!("installed the hook into {}", Tilde(rc)),
+            EnableOutcome::Refreshed => format!("refreshed the hook in {}", Tilde(rc)),
+        })
+    }
+
+    fn revert(&self) -> Result<Option<String>> {
+        if !rc_disable()? {
+            return Ok(None);
+        }
+        Ok(Some(format!("removed the hook from {}", Tilde(rc_file()?))))
+    }
+
+    fn already_off(&self) -> String {
+        match rc_file() {
+            Ok(rc) => format!("startup loading was already disabled ({} has no hook)", Tilde(rc)),
+            Err(_) => "startup loading was already disabled".to_string(),
+        }
+    }
+
+    fn applied_hint(&self, profile: &str) -> Vec<String> {
+        vec![format!(
+            "new shells load it; `envc activate {profile}` for this one"
+        )]
+    }
+
+    fn advice(&self, already_on: bool, _quiet: bool) -> Result<Vec<String>> {
+        if already_on {
+            return Ok(Vec::new());
+        }
+        Ok(vec![format!("open a new shell, or `source {}`.", Tilde(rc_file()?))])
+    }
+
+    fn check_environment(&self) {
+        warn_if_not_on_path();
+    }
+}
+
+/// Windows: the profile's variables, written permanently.
+#[cfg(windows)]
+struct Windows;
 
 #[cfg(windows)]
-fn startup_is_on() -> Result<bool> {
-    Ok(UserStack::load()?.is_some())
-}
+impl Layer for Windows {
+    fn prepare(&self) -> Result<Vec<String>> {
+        Ok(vec![
+            format!("shell:   {}", Shell::detect().name()),
+            "startup: user environment (no rc file to patch)".to_string(),
+        ])
+    }
 
-/// Where startup loading lives, for the reports.
-#[cfg(not(windows))]
-fn startup_where() -> Result<String> {
-    Ok(Tilde(&rc_file()?).to_string())
-}
+    fn describe(&self) -> Result<String> {
+        Ok("user environment".to_string())
+    }
 
-#[cfg(windows)]
-fn startup_where() -> Result<String> {
-    Ok("user environment".to_string())
+    fn is_on(&self) -> Result<bool> {
+        Ok(UserStack::load()?.is_some())
+    }
+
+    /// There is no rc file that cmd and PowerShell both read, so the variables
+    /// go into the user environment, where every process started afterwards
+    /// sees them. What they held before is recorded first, because `revert` has
+    /// to be able to put that back.
+    fn apply(&self, profile: &str) -> Result<String> {
+        let assignments = parse_env_file(&profile_env_file(profile)?)?;
+        if assignments.is_empty() {
+            return Err(anyhow!("profile '{profile}' sets no variables"));
+        }
+
+        let keys: Vec<&str> = assignments.iter().map(|a| a.key.as_str()).collect();
+        let before = read_user_vars(&keys)?;
+
+        let entries = assignments
+            .iter()
+            .map(|a| Entry {
+                key: a.key.clone(),
+                prev: before.get(&a.key).cloned().flatten(),
+                now: Some(a.value.clone()),
+            })
+            .collect();
+
+        let pairs: Vec<(String, Option<String>)> = assignments
+            .iter()
+            .map(|a| (a.key.clone(), Some(a.value.clone())))
+            .collect();
+
+        write_user_vars(&pairs)?;
+        UserStack(Stack::new(profile, entries)).save()?;
+
+        Ok(format!(
+            "wrote {} variables to your user environment",
+            assignments.len()
+        ))
+    }
+
+    fn revert(&self) -> Result<Option<String>> {
+        let Some(user_stack) = UserStack::load()? else {
+            return Ok(None);
+        };
+
+        // `None` on an entry means the variable did not exist at the user
+        // level, so this removes it rather than setting it empty.
+        let pairs: Vec<(String, Option<String>)> = user_stack
+            .0
+            .entries
+            .iter()
+            .map(|e| (e.key.clone(), e.prev.clone()))
+            .collect();
+
+        write_user_vars(&pairs)?;
+        UserStack::remove()?;
+        Ok(Some(format!("restored {} user variables", pairs.len())))
+    }
+
+    fn already_off(&self) -> String {
+        "startup loading was already disabled".to_string()
+    }
+
+    fn applied_hint(&self, _profile: &str) -> Vec<String> {
+        vec![
+            "new shells and programs see them; this one does not".to_string(),
+            "`envc disable` puts the previous values back".to_string(),
+        ]
+    }
+
+    fn advice(&self, _already_on: bool, quiet: bool) -> Result<Vec<String>> {
+        if quiet {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            "to apply a profile to just this shell:".to_string(),
+            "    cmd        envc activate work && call \"%TEMP%\\envc\\activate.cmd\""
+                .to_string(),
+            "    powershell envc activate work | Invoke-Expression".to_string(),
+        ])
+    }
+
+    fn check_environment(&self) {
+        // Nothing to check: `enable` does not depend on the shell finding the
+        // binary on PATH.
+    }
 }
 
 fn print_startup_line(c: &Palette, startup: Option<&str>) -> Result<()> {
-    let enabled = startup_is_on()?;
+    let enabled = layer().is_on()?;
     let state = if enabled {
         c.green("enabled")
     } else {
         c.yellow("disabled")
     };
     let suffix = if enabled {
-        format!(" ({})", startup_where()?)
+        format!(" ({})", layer().describe()?)
     } else {
         String::new()
     };
@@ -1584,8 +1925,8 @@ fn print_startup_line(c: &Palette, startup: Option<&str>) -> Result<()> {
     }
 
     // The other half, when it disagrees with the startup choice.
-    if let Ok(current) = std::env::var("ENVC_ACTIVE") {
-        if enabled && startup == Some(current.as_str()) {
+    if let Some(current) = Env::get().active.as_deref() {
+        if enabled && startup == Some(current) {
             return Ok(());
         }
         println!("this shell:      {current}");
@@ -1655,7 +1996,7 @@ fn cmd_activate(name: &str, quiet: bool, shell: Shell) -> Result<()> {
     }
     let assignments = parse_env_file(&file)?;
 
-    let current: HashMap<String, String> = std::env::vars().collect();
+    let current = Env::get().vars.clone();
     let previous = Stack::load()?;
 
     let mut lines = Vec::new();
@@ -1674,7 +2015,7 @@ fn cmd_activate(name: &str, quiet: bool, shell: Shell) -> Result<()> {
         lines.push(shell.assign(&a.key, &a.value));
     }
     lines.push(shell.assign(ENVC_ACTIVE_VAR, name));
-    emit(shell, "activate", &lines)?;
+    shell.deliver("activate", &lines)?;
 
     Stack::new(name, entries).save()?;
 
@@ -1693,7 +2034,7 @@ fn cmd_deactivate(quiet: bool, shell: Shell) -> Result<()> {
         Some(stack) => {
             let mut lines = stack.restore_lines(shell);
             lines.push(shell.unset(ENVC_ACTIVE_VAR));
-            emit(shell, "deactivate", &lines)?;
+            shell.deliver("deactivate", &lines)?;
             Stack::remove()?;
 
             notify(
@@ -1707,8 +2048,8 @@ fn cmd_deactivate(quiet: bool, shell: Shell) -> Result<()> {
             print_activation_hint(quiet, "envc deactivate", shell);
         }
         None => {
-            if std::env::var_os("ENVC_ACTIVE").is_some() {
-                emit(shell, "deactivate", &[shell.unset(ENVC_ACTIVE_VAR)])?;
+            if Env::get().active.is_some() {
+                shell.deliver("deactivate", &[shell.unset(ENVC_ACTIVE_VAR)])?;
                 notify(quiet, "nothing on the restore stack; cleared ENVC_ACTIVE only");
             } else {
                 notify(quiet, "no profile is active in this shell");
@@ -1739,35 +2080,27 @@ fn cmd_autoload(shell: Shell) -> Result<()> {
     }
 
     let assignments = parse_env_file(&file)?;
-    let current: HashMap<String, String> = std::env::vars().collect();
+    let current = Env::get().vars.clone();
 
     let mut lines = Vec::new();
     for a in &assignments {
         lines.push(shell.assign(&a.key, &a.value));
     }
     lines.push(shell.assign(ENVC_ACTIVE_VAR, &profile));
-    emit(shell, "autoload", &lines)?;
+    shell.deliver("autoload", &lines)?;
 
     Stack::new(&profile, Stack::entries_from(&current, &assignments)).save()?;
     Ok(())
 }
 
-/// First-time setup: work out which startup file the login shell reads, then
-/// inject the hook into it unless it is already there.
-#[cfg(not(windows))]
+/// First-time setup: get this platform's startup mechanism in place and report
+/// what the user has and what to do next.
 fn cmd_init(quiet: bool) -> Result<()> {
-    let rc = rc_file()?;
-    let shell = detect_shell();
-    let already = rc_is_enabled()?;
+    let layer = layer();
+    let already_on = layer.is_on()?;
 
-    println!("shell:   {} ({})", shell.name(), detection_source());
-    println!("rc file: {}", Tilde(&rc));
-
-    if already {
-        println!("hook:    already installed");
-    } else {
-        rc_enable()?;
-        println!("hook:    installed");
+    for line in layer.prepare()? {
+        println!("{line}");
     }
 
     match Startup::load()? {
@@ -1775,11 +2108,14 @@ fn cmd_init(quiet: bool) -> Result<()> {
         None => println!("profile: none -- `envc enable <name>` picks one"),
     }
 
-    warn_if_not_on_path();
+    layer.check_environment();
 
-    if !already {
+    let advice = layer.advice(already_on, quiet)?;
+    if !advice.is_empty() {
         println!();
-        println!("open a new shell, or `source {}`.", Tilde(&rc));
+        for line in advice {
+            println!("{line}");
+        }
     }
     if !quiet {
         println!();
@@ -1788,108 +2124,30 @@ fn cmd_init(quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Windows has nothing to patch.
-///
-/// cmd and PowerShell each read a different startup file, so there is no single
-/// place to install a hook. `enable` sidesteps that by writing user-level
-/// environment variables instead, which every new process sees regardless of
-/// shell -- so `init` only has to report what is going on.
-#[cfg(windows)]
-fn cmd_init(quiet: bool) -> Result<()> {
-    println!("shell:   {}", Shell::detect().name());
-    println!("startup: user environment (no rc file to patch)");
-
-    match Startup::load()? {
-        Some(s) => println!("profile: {}", s.profile),
-        None => println!("profile: none -- `envc enable <name>` picks one"),
-    }
-
-    if !quiet {
-        println!();
-        println!("next: envc create work, then envc enable work");
-        println!();
-        println!("to apply a profile to just this shell:");
-        println!("    cmd        envc activate work && call \"%TEMP%\\envc\\activate.cmd\"");
-        println!("    powershell envc activate work | Invoke-Expression");
-    }
-    Ok(())
-}
-
-/// Choose the profile new shells load and make sure the hook is in place.
+/// Choose the profile new shells load, and make sure this platform's mechanism
+/// for loading it is in place.
 ///
 /// This is the startup half of envc: it changes what the *next* shell does and
-/// leaves the current one untouched (`activate` is the other half).
-#[cfg(windows)]
+/// leaves the current one alone. `activate` is the other half.
 fn cmd_enable(name: Option<&str>) -> Result<()> {
-    enable_user_env(Startup {
-        profile: resolve_startup_profile(name)?,
-    })
-}
-
-/// POSIX: install (or refresh) the rc hook that loads the profile.
-#[cfg(not(windows))]
-fn cmd_enable(name: Option<&str>) -> Result<()> {
-    // The name is moved into the state and read back out of it, so nothing is
-    // cloned on the way to the messages below.
+    // The name is moved into the state and read back from it below, so nothing
+    // is cloned on the way to those messages.
     let startup = Startup {
         profile: resolve_startup_profile(name)?,
     };
+    let layer = layer();
+
+    // Applied before it is remembered: a mechanism that failed to install
+    // should not leave a choice recorded that nothing will act on.
+    let what = layer.apply(&startup.profile)?;
     startup.save()?;
-    let rc = rc_file()?;
-    let verb = match rc_enable()? {
-        EnableOutcome::Installed => "installed the hook into",
-        EnableOutcome::Refreshed => "refreshed the hook in",
-    };
 
     println!("startup loading enabled: {}", startup.profile);
-    println!("  {verb} {}", Tilde(&rc));
-    println!(
-        "  new shells load it; `envc activate {}` for this one",
-        startup.profile
-    );
-
-    warn_if_not_on_path();
-    Ok(())
-}
-
-/// Windows `enable`: make the profile's variables permanent.
-///
-/// There is no rc file that cmd and PowerShell both read, so the variables go
-/// into the user environment instead -- every process started afterwards sees
-/// them, whatever shell it is. What they held before is recorded first, because
-/// `disable` has to be able to put that back.
-#[cfg(windows)]
-fn enable_user_env(startup: Startup) -> Result<()> {
-    let assignments = parse_env_file(&profile_env_file(&startup.profile)?)?;
-    if assignments.is_empty() {
-        return Err(anyhow!("profile '{}' sets no variables", startup.profile));
+    println!("  {what}");
+    for line in layer.applied_hint(&startup.profile) {
+        println!("  {line}");
     }
-
-    let keys: Vec<&str> = assignments.iter().map(|a| a.key.as_str()).collect();
-    let before = read_user_vars(&keys)?;
-
-    let entries = assignments
-        .iter()
-        .map(|a| Entry {
-            key: a.key.clone(),
-            prev: before.get(&a.key).cloned().flatten(),
-            now: Some(a.value.clone()),
-        })
-        .collect();
-
-    let pairs: Vec<(String, Option<String>)> = assignments
-        .iter()
-        .map(|a| (a.key.clone(), Some(a.value.clone())))
-        .collect();
-
-    write_user_vars(&pairs)?;
-    UserStack(Stack::new(&startup.profile, entries)).save()?;
-    startup.save()?;
-
-    println!("startup loading enabled: {}", startup.profile);
-    println!("  wrote {} variables to your user environment", assignments.len());
-    println!("  new shells and programs see them; this one does not");
-    println!("  `envc disable` puts the previous values back");
+    layer.check_environment();
     Ok(())
 }
 
@@ -1946,57 +2204,20 @@ fn suggested_install_path() -> String {
     dir.join("envc").display().to_string()
 }
 
-/// Stop new shells from loading anything. The current shell keeps whatever it
-/// has applied, and the chosen profile is remembered for a later `enable`.
-#[cfg(not(windows))]
+/// Stop new shells from loading a profile. The current shell keeps what it has
+/// applied, and the choice is remembered for a later `enable`.
 fn cmd_disable(quiet: bool) -> Result<()> {
-    let rc = rc_file()?;
-    if rc_disable()? {
-        println!("startup loading disabled");
-        println!("  removed the hook from {}", Tilde(&rc));
-        if let Some(startup) = Startup::load()? {
-            println!(
-                "  '{}' remembered; a bare `envc enable` turns it back on",
-                startup.profile
-            );
-        }
+    let layer = layer();
+    let Some(what) = layer.revert()? else {
         if !quiet {
-            println!("  this shell keeps its profile -- `envc deactivate` drops it.");
-        }
-    } else if !quiet {
-        println!(
-            "startup loading was already disabled ({} has no hook)",
-            Tilde(&rc)
-        );
-        println!("  run `envc enable` to turn it back on");
-    }
-    Ok(())
-}
-
-/// Windows `disable`: put the user-level variables back the way they were.
-#[cfg(windows)]
-fn cmd_disable(quiet: bool) -> Result<()> {
-    let Some(user_stack) = UserStack::load()? else {
-        if !quiet {
-            println!("startup loading was already disabled");
+            println!("{}", layer.already_off());
+            println!("  run `envc enable` to turn it back on");
         }
         return Ok(());
     };
 
-    // `None` means the variable did not exist at the user level, so this
-    // removes it rather than setting it empty.
-    let pairs: Vec<(String, Option<String>)> = user_stack
-        .0
-        .entries
-        .iter()
-        .map(|e| (e.key.clone(), e.prev.clone()))
-        .collect();
-
-    write_user_vars(&pairs)?;
-    UserStack::remove()?;
-
     println!("startup loading disabled");
-    println!("  restored {} user variables", pairs.len());
+    println!("  {what}");
     if let Some(startup) = Startup::load()? {
         println!(
             "  '{}' remembered; a bare `envc enable` turns it back on",
@@ -2036,19 +2257,19 @@ fn cmd_status() -> Result<()> {
     let c = Palette::new();
     let home = envc_home()?;
     let stack = Stack::load()?;
-    let shell_active = std::env::var("ENVC_ACTIVE").ok();
+    let shell_active = Env::get().active.clone();
 
     println!("{} {}", c.bold("envc"), env!("CARGO_PKG_VERSION"));
-    println!("  {:<17}{}", "home", Tilde(&home));
+    println!("  {:<17}{}", "home", Tilde(home));
     println!("  {:<17}{}", "shell", shell.name());
 
-    let enabled = startup_is_on()?;
+    let enabled = layer().is_on()?;
     let state = if enabled {
         c.green("enabled")
     } else {
         c.yellow("disabled")
     };
-    println!("  {:<17}{} ({})", "startup loading", state, startup_where()?);
+    println!("  {:<17}{} ({})", "startup loading", state, layer().describe()?);
 
     // `Startup::load` and not `remembered_startup`: reporting must not migrate.
     let startup = Startup::load()?.map(|s| s.profile);
@@ -2123,13 +2344,14 @@ fn notify(quiet: bool, msg: impl AsRef<str>) {
 /// Is the shell code being captured (and will therefore be eval'd), or is it
 /// going straight to the terminal where it does nothing useful?
 fn hint_wanted() -> bool {
-    io::stdout().is_terminal() && std::env::var("ENVC_WRAPPED").as_deref() != Ok("1")
+    io::stdout().is_terminal() && !Env::get().wrapped
 }
 
 /// Printed when shell code was generated but nothing is going to eval it.
 fn print_activation_hint(quiet: bool, command: &str, shell: Shell) {
-    // cmd got a batch file instead of stdout; `emit` already said which one.
-    if quiet || shell == Shell::Cmd || !hint_wanted() {
+    // Only shells that evaluate stdout need telling how; cmd got a batch file
+    // and `Shell::write_batch` has already said which one.
+    if quiet || !shell.evaluates_stdout() || !hint_wanted() {
         return;
     }
     eprintln!();
@@ -2140,10 +2362,10 @@ fn print_activation_hint(quiet: bool, command: &str, shell: Shell) {
 
 #[cfg(not(windows))]
 fn binary_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = &Env::get().path else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| dir.join("envc").is_file())
+    std::env::split_paths(path).any(|dir| dir.join("envc").is_file())
 }
 
 #[cfg(not(windows))]
@@ -2161,7 +2383,7 @@ struct Palette {
 impl Palette {
     fn new() -> Self {
         Palette {
-            on: io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            on: io::stdout().is_terminal() && !Env::get().no_color,
         }
     }
 
