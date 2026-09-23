@@ -1029,17 +1029,43 @@ fn parse_user_stack_state(content: &str, path: &Path) -> Result<Option<UserStack
 /// `-NonInteractive` so it can never sit there waiting for input.
 #[cfg(windows)]
 fn powershell(script: &str) -> Result<String> {
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .with_context(|| "cannot run powershell")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "powershell failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    // `powershell` is on PATH on any normal Windows, but a trimmed PATH would
+    // otherwise fail with something unhelpful, so fall back to where the
+    // built-in 5.1 interpreter always lives.
+    let mut candidates = vec![PathBuf::from("powershell")];
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        candidates.push(
+            Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+        );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+
+    let mut spawn_error = None;
+    for exe in &candidates {
+        let out = match std::process::Command::new(exe)
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                spawn_error = Some(format!("{}: {e}", exe.display()));
+                continue;
+            }
+        };
+        // It ran, so this is the right interpreter -- a failure now is the
+        // script's, not the lookup's.
+        if !out.status.success() {
+            return Err(anyhow!(
+                "powershell failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    Err(anyhow!(
+        "cannot run powershell ({})",
+        spawn_error.unwrap_or_default()
+    ))
 }
 
 /// Read the current user-level value of each key. `None` means "not set at the

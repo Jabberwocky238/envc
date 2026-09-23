@@ -5,9 +5,10 @@
 //! 只影响当前会话，PowerShell 直接求值 stdout，cmd 没有 `eval`，所以代码落到
 //! `%TEMP%\envc\activate.cmd`，由 `call` 执行。
 //!
-//! 注意：测 `enable`/`disable` 会真的动用户环境变量。变量名都带 `ENVC_T_<pid>_`
-//! 前缀，Drop 里还会兜底删一遍，但仍然是在改测试机自己的注册表——这是这个功能
-//! 的性质决定的，绕不开。
+//! 注意：测 `enable`/`disable` 会真的动用户环境变量。变量名都带
+//! `ENVC_T_<pid>_<序号>_` 前缀（序号是必须的：测试并行跑，共用一份注册表），
+//! Drop 里还会兜底删一遍。但仍然是在改测试机自己的注册表——这是这个功能的性质
+//! 决定的，绕不开。
 #![cfg(target_os = "windows")]
 
 use std::ffi::OsString;
@@ -27,20 +28,20 @@ struct Lab {
 impl Lab {
     fn new() -> Lab {
         static N: AtomicU32 = AtomicU32::new(0);
+        // `cargo test` 并行跑，而这些测试改的是**同一份**用户环境：变量名必须
+        // 每个测试一份，否则两个测试会互相把对方的值改掉。
+        let n = N.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "envc-win-{}-{}",
+            "envc-win-{}-{n}",
             std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("home")).unwrap();
         fs::create_dir_all(root.join("tmp")).unwrap();
-        fs::copy(ENVC, root.join("bin/envc.exe")).unwrap();
 
         Lab {
             root,
-            prefix: format!("ENVC_T_{}_", std::process::id()),
+            prefix: format!("ENVC_T_{}_{n}_", std::process::id()),
         }
     }
 
@@ -61,7 +62,11 @@ impl Lab {
         format!("{}{name}", self.prefix)
     }
 
-    /// 只喂我们要的变量。PATH 必须留着——`powershell` 和 `cmd` 得能被找到。
+    /// 只覆盖这几个，其余**继承**。
+    ///
+    /// Windows 上不能像 Linux 那样把环境刮干净：SystemRoot、PATHEXT、ComSpec
+    /// 这些没了，PowerShell 和 cmd 自己就起不来。变量名带 pid 和序号，继承来的
+    /// 环境不会和测试用的撞上。
     fn env(&self) -> Vec<(&'static str, OsString)> {
         vec![
             ("USERPROFILE", self.home().into()),
@@ -69,18 +74,13 @@ impl Lab {
             ("ENVC_HOME", self.envc_home().into()),
             ("TEMP", self.root.join("tmp").into()),
             ("TMP", self.root.join("tmp").into()),
-            (
-                "PATH",
-                std::env::var_os("PATH").unwrap_or_else(|| r"C:\Windows\System32".into()),
-            ),
         ]
     }
 
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
-        cmd.env_clear()
-            .envs(self.env())
-            // 继承来的就会变成「这个 shell 装了什么」。
+        cmd.envs(self.env())
+            // 继承来的会被当成「这个 shell 已经装了什么」。
             .env_remove("ENVC_ACTIVE");
         cmd
     }
@@ -100,10 +100,14 @@ impl Lab {
     }
 
     /// cmd 里跑一段，返回 stdout。
+    ///
+    /// `/v:on` 打开延迟展开：cmd 在**解析整行**时就把 `%VAR%` 换掉了，所以
+    /// `call x.cmd && echo %VAR%` 永远读不到 `x.cmd` 里刚 set 的值，必须写
+    /// `!VAR!`。
     fn cmd(&self, script: &str) -> String {
         let out = self
             .command("cmd")
-            .args(["/c", script])
+            .args(["/v:on", "/c", script])
             .output()
             .expect("cmd 应该能启动");
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
@@ -151,6 +155,16 @@ impl Drop for Lab {
     }
 }
 
+/// 把一次运行的 stdout / stderr / 退出码都摊开——少了 stderr，失败就只剩猜。
+fn describe(out: &Output) -> String {
+    format!(
+        "exit={:?}\n     stdout: {}\n     stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        String::from_utf8_lossy(&out.stderr).trim_end()
+    )
+}
+
 fn checks(failures: Vec<String>) {
     assert!(failures.is_empty(), "\n{} 处失败:\n{}", failures.len(), failures.join("\n"));
 }
@@ -163,14 +177,15 @@ fn checks(failures: Vec<String>) {
 fn enable_writes_user_level_variables() {
     let lab = Lab::new();
     let foo = lab.key("FOO");
-    lab.profile("work", &format!("{foo}=from-work\nBAR=$PRE_EXISTING\n"));
+    // 第二个变量走一次环境展开，确认写进注册表的是展开后的值。
+    let bar = lab.key("BAR");
+    lab.profile("work", &format!("{foo}=from-work\n{bar}=$HOME\n"));
 
     let out = lab.run(&["enable", "work"]);
-    let report = String::from_utf8_lossy(&out.stdout).to_string();
 
     let mut failures = Vec::new();
     if !out.status.success() {
-        failures.push(format!("enable 应该成功:\n{report}"));
+        failures.push(format!("enable 应该成功:\n     {}", describe(&out)));
     }
     if lab.user_var(&foo).as_deref() != Some("from-work") {
         failures.push(format!("{foo} 该被写进用户环境，实际 {:?}", lab.user_var(&foo)));
@@ -278,8 +293,10 @@ fn powershell_evaluates_the_printed_code() {
         failures.push(format!("该打印 PowerShell 语法:\n{code}"));
     }
 
-    // 真的求值一遍，看变量有没有落到会话里。
-    let value = lab.powershell(&format!("{code}; Write-Output $env:{foo}"));
+    // 真的求值一遍，看变量有没有落到会话里。多行代码要用 `; ` 接起来：
+    // 直接拼会在行尾留下 `\n;`，那不是合法的语句序列。
+    let joined = code.lines().collect::<Vec<_>>().join("; ");
+    let value = lab.powershell(&format!("{joined}; Write-Output $env:{foo}"));
     if value != "from-work" {
         failures.push(format!("求值之后该是 from-work，实际 {value:?}"));
     }
@@ -307,7 +324,7 @@ fn cmd_runs_the_batch_file_it_writes() {
     }
 
     // 真正 call 一遍——这是 cmd 那条路唯一的端到端验证。
-    let value = lab.cmd(&format!("call \"{}\" && echo %{}%", path.display(), foo));
+    let value = lab.cmd(&format!("call \"{}\" && echo !{}!", path.display(), foo));
     if value != "from work" {
         failures.push(format!("call 之后该是 from work，实际 {value:?}"));
     }
@@ -332,7 +349,7 @@ fn cmd_deactivate_undoes_what_activate_did() {
     }
 
     // 原本不存在的变量，撤销之后该是空的。
-    let value = lab.cmd(&format!("call \"{}\" && echo [%{}%]", path.display(), foo));
+    let value = lab.cmd(&format!("call \"{}\" && echo [!{}!]", path.display(), foo));
     if value != "[]" {
         failures.push(format!("撤销之后该是空的，实际 {value:?}"));
     }

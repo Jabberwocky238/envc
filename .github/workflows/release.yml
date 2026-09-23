@@ -41,6 +41,9 @@ jobs:
     name: build (${{ matrix.target }})
     # Six binaries only after all three suites pass.
     needs: test
+    # A manual run on a branch is for the tests only: publishing from it would
+    # name the assets after the branch and create a release nobody asked for.
+    if: github.ref_type == 'tag'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -140,6 +143,7 @@ jobs:
   release:
     name: publish
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
