@@ -1,0 +1,46 @@
+TWO HALVES:
+  Startup    -- `envc enable <name>` picks the profile new shells load and
+                installs the hook; `envc disable <name>` stops it. Kept in
+                ~/.envc/startup, so it outlives any single shell.
+  This shell -- `envc use <name>` pushes a profile onto this shell;
+                `envc unuse <name>` pops it. Neither changes the next shell.
+
+THE STACK:
+  Profiles stack up. `use` pushes a frame on top, `unuse <name>` takes that
+  frame out and replays the old values it covered. Frames above it are
+  re-applied on the restored base, so the rest of the stack stays in effect.
+
+      envc use work       base > work
+      envc use dev        base > work > dev
+      envc unuse work     base > dev
+
+  A child process cannot change its parent shell, so use/unuse print shell
+  code on stdout. Run them through the wrapper `envc init` installs, or:
+
+      eval "$(envc use work)"
+
+  Each shell has its own stack, ~/.envc/stack/<session>. Before a use or
+  unuse, envc checks the .env of every frame it relies on; if one changed
+  since it was pushed, it lists the dangling and changed variables and asks
+  for y. Every .env that was applied is kept in ~/.envc/snapshots, and every
+  push and pop, with its restore snapshot, in ~/.envc/history.
+
+WINDOWS:
+  No rc file is read by both cmd and PowerShell, so `enable` puts the profile's
+  variables into the user environment instead: permanent, and visible to every
+  program started afterwards. `disable` restores the previous values.
+
+  use/unuse still only affect the current shell. PowerShell evaluates what is
+  printed; cmd has no `eval`, so the code goes to %TEMP%\envc\use.cmd:
+
+      powershell   envc use work | Invoke-Expression
+      cmd          envc use work && call "%TEMP%\envc\use.cmd"
+
+SHELL INTEGRATION:
+  `envc init` detects the login shell from $SHELL and injects the hook into
+  ~/.bashrc or ~/.zshrc. Re-running is safe.
+
+CONFIG (~/.envc/config, key = value):
+  shell         bash | powershell | cmd -- which syntax to emit
+  rc            rc file to patch, overriding the detection
+  color         auto | always | never

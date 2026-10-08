@@ -1,224 +1,186 @@
-//! macos: envc 在 macOS / zsh 上的集成测试，登录 shell 的启动文件是 ~/.zshrc。
-//!
-//! 这里只测 macOS 的**差异**部分：登录 shell 的检测、`.zshrc` 这个名字、钩子在
-//! zsh 语法下成立、以及真 zsh 里走一遍 activate/deactivate。与系统无关的行为覆盖
-//! 在 tests/linux.rs 里——那是同一份 envc 逻辑，不必在两个平台重复一遍。
 #![cfg(target_os = "macos")]
 
+mod general;
+
 use std::fs;
-use std::os::unix::fs::symlink;
-use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::process::Output;
 
-const ENVC: &str = env!("CARGO_BIN_EXE_envc");
+use general::{Checks, Lab, Posix};
 
-struct Lab {
-    root: PathBuf,
-    /// $SHELL 的值；`None` 表示这个变量不存在（走 OS 默认）。
-    shell: Option<String>,
+const ZSH: Posix = Posix { program: "zsh" };
+
+struct Zsh {
+    lab: Lab,
+    shell: Option<&'static str>,
 }
 
-impl Lab {
-    fn new(shell: Option<&str>) -> Lab {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "envc-macos-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("bin")).unwrap();
-        symlink(ENVC, root.join("bin/envc")).unwrap();
+impl std::ops::Deref for Zsh {
+    type Target = Lab;
 
-        let lab = Lab {
-            root,
-            shell: shell.map(str::to_string),
-        };
-        fs::create_dir_all(lab.home()).unwrap();
-        lab
+    fn deref(&self) -> &Lab {
+        &self.lab
+    }
+}
+
+impl Zsh {
+    fn new(shell: Option<&'static str>) -> Zsh {
+        Zsh {
+            lab: Lab::new("macos"),
+            shell,
+        }
     }
 
-    fn home(&self) -> PathBuf {
-        self.root.join("home")
-    }
-
-    fn envc_home(&self) -> PathBuf {
-        self.home().join(".envc")
-    }
-
-    fn zshrc(&self) -> PathBuf {
+    fn zshrc(&self) -> std::path::PathBuf {
         self.home().join(".zshrc")
     }
 
-    /// 每个子进程都从这里取环境：不设 ENVC_RC，因为检测逻辑本身是被测对象。
-    fn command(&self, program: &str) -> Command {
-        let mut path = vec![self.root.join("bin")];
-        path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
-
-        let mut cmd = Command::new(program);
-        cmd.env_clear()
-            .env("HOME", self.home())
-            .env("ENVC_HOME", self.envc_home())
-            .env("PATH", std::env::join_paths(path).unwrap())
-            // 继承来的这两个会污染结果：「这个 shell 装了什么」和登录 shell。
-            .env_remove("ENVC_ACTIVE")
-            .env_remove("SHELL");
-        if let Some(shell) = &self.shell {
+    fn command(&self, program: &str) -> std::process::Command {
+        let mut cmd = self.lab.command(program);
+        if let Some(shell) = self.shell {
             cmd.env("SHELL", shell);
         }
         cmd
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        self.command(ENVC)
-            .args(args)
-            .output()
-            .expect("envc 应该能启动")
+    fn envc(&self, args: &[&str]) -> Output {
+        self.command(general::ENVC).args(args).output().expect("envc should start")
     }
 
-    /// 在一个真的 zsh 里跑脚本。
     fn zsh(&self, script: &str) -> String {
-        let out = self.command("zsh").arg("-c").arg(script).output().expect("zsh 应该能启动");
+        let out = self.command("zsh").arg("-c").arg(script).output().expect("zsh should start");
         String::from_utf8_lossy(&out.stdout).trim_end().to_string()
     }
 
-    fn profile(&self, name: &str, body: &str) {
-        let dir = self.envc_home().join("profiles").join(name);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(".env"), body).unwrap();
+    fn sourced(&self, script: &str) -> String {
+        self.zsh(&format!("source \"{}\"; {script}", self.zshrc().display()))
     }
 
-    fn read(&self, rel: &str) -> String {
-        fs::read_to_string(self.envc_home().join(rel)).unwrap_or_default()
-    }
-}
-
-impl Drop for Lab {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+    fn two_profiles(&self) {
+        self.profile("work", "EDITOR=vim\nPROJECT=work\n");
+        self.profile("alt", "EDITOR=emacs\nPROJECT=alt\n");
     }
 }
 
-fn two_profiles(lab: &Lab) {
-    lab.profile("work", "EDITOR=vim\nPROJECT=work\n");
-    lab.profile("alt", "EDITOR=emacs\nPROJECT=alt\n");
+#[test]
+fn overlap_in_zsh() {
+    general::overlap(&Lab::new("macos"), &ZSH);
 }
 
-// ===========================================================================
-// 登录 shell 的检测
-// ===========================================================================
+#[test]
+fn two_zsh_sessions_keep_their_own_stacks() {
+    general::cross_sessions(&Lab::new("macos"), &ZSH);
+}
+
+#[test]
+fn a_changed_profile_asks_before_use() {
+    general::drift(&Lab::new("macos"));
+}
+
+#[test]
+fn unuse_names_what_it_pops() {
+    general::unuse_needs_a_name_on_the_stack(&Lab::new("macos"));
+}
+
+#[test]
+fn a_stale_stack_is_ignored() {
+    general::a_stale_stack_is_ignored(&Lab::new("macos"));
+}
+
+#[test]
+fn settings_come_from_the_config_file() {
+    general::config_file(&Lab::new("macos"));
+}
 
 #[test]
 fn a_zsh_login_shell_gets_the_hook_in_zshrc() {
-    let lab = Lab::new(Some("/bin/zsh"));
-
-    let report = String::from_utf8_lossy(&lab.run(&["init"]).stdout).to_string();
+    let lab = Zsh::new(Some("/bin/zsh"));
+    let report = String::from_utf8_lossy(&lab.envc(&["init"]).stdout).to_string();
     let rc = fs::read_to_string(lab.zshrc()).unwrap_or_default();
 
-    assert!(report.contains("shell:   zsh"), "报告里应该说 zsh:\n{report}");
-    assert!(report.contains(".zshrc"), "报告里应该指向 .zshrc:\n{report}");
-    assert!(
-        rc.contains("# >>> envc initialize >>>"),
-        "钩子该写进 ~/.zshrc:\n{rc}"
-    );
+    let mut c = Checks::default();
+    c.has("the report says zsh", "shell:   zsh", &report);
+    c.has("the report points at .zshrc", ".zshrc", &report);
+    c.has("the hook goes into ~/.zshrc", "# >>> envc initialize >>>", &rc);
+    c.done();
 }
 
 #[test]
 fn without_a_shell_variable_macos_defaults_to_zsh() {
-    let lab = Lab::new(None);
-    lab.run(&["init"]);
-
-    let rc = fs::read_to_string(lab.zshrc()).unwrap_or_default();
-    assert!(
-        rc.contains("# >>> envc initialize >>>"),
-        "$SHELL 不存在时 macOS 该默认 zsh"
+    let lab = Zsh::new(None);
+    lab.envc(&["init"]);
+    let mut c = Checks::default();
+    c.has(
+        "without $SHELL, macOS defaults to zsh",
+        "# >>> envc initialize >>>",
+        &fs::read_to_string(lab.zshrc()).unwrap_or_default(),
     );
-    assert!(
-        !lab.home().join(".bashrc").exists(),
-        "不该顺手也去写 .bashrc"
-    );
+    c.is_true(".bashrc is not written as well", !lab.home().join(".bashrc").exists());
+    c.done();
 }
-
-// ===========================================================================
-// 在真的 zsh 里
-// ===========================================================================
 
 #[test]
 fn the_hook_is_valid_zsh_syntax() {
-    let lab = Lab::new(Some("/bin/zsh"));
-    lab.run(&["init"]);
-
-    // -n 只解析不执行，否则钩子里的 eval 会去调二进制。
-    let out = lab
-        .command("zsh")
-        .arg("-n")
-        .arg(lab.zshrc())
-        .output()
-        .expect("zsh 应该能启动");
-
-    assert!(
-        out.status.success(),
-        "钩子应当是合法的 zsh:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let lab = Zsh::new(Some("/bin/zsh"));
+    lab.envc(&["init"]);
+    let out = lab.command("zsh").arg("-n").arg(lab.zshrc()).output().expect("zsh should start");
+    Checks::default()
+        .is_true(
+            &format!("the hook is valid zsh:\n{}", String::from_utf8_lossy(&out.stderr)),
+            out.status.success(),
+        )
+        .done();
 }
 
 #[test]
-fn activate_and_deactivate_round_trip_in_zsh() {
-    let lab = Lab::new(Some("/bin/zsh"));
-    two_profiles(&lab);
-
+fn use_and_unuse_round_trip_in_zsh() {
+    let lab = Zsh::new(Some("/bin/zsh"));
+    lab.two_profiles();
     let out = lab.zsh(
         r#"EDITOR=nano; export EDITOR
 unset PROJECT
-eval "$(envc activate work)"
+eval "$(envc use work)"
 printf "on=%s,%s " "$EDITOR" "$PROJECT"
-eval "$(envc deactivate)"
+eval "$(envc unuse work)"
 printf "off=%s,%s" "$EDITOR" "${PROJECT-<unset>}""#,
     );
+    Checks::default().eq("use/unuse round trip in zsh", "on=vim,work off=nano,<unset>", &out).done();
+}
 
-    assert_eq!(out, "on=vim,work off=nano,<unset>");
+#[test]
+fn the_wrapper_works_in_zsh() {
+    let lab = Zsh::new(Some("/bin/zsh"));
+    lab.two_profiles();
+    lab.envc(&["init"]);
+    let out = lab.sourced(
+        r#"unset PROJECT; envc use alt 2>/dev/null; printf "%s " "$PROJECT"; envc pop alt 2>/dev/null; printf "%s" "${PROJECT-<unset>}""#,
+    );
+    Checks::default().eq("the zsh hook wraps use/pop", "alt <unset>", &out).done();
 }
 
 #[test]
 fn a_new_zsh_autoloads_the_startup_profile() {
-    let lab = Lab::new(Some("/bin/zsh"));
-    two_profiles(&lab);
-    lab.run(&["init"]);
-    lab.run(&["enable", "work"]);
-
-    let out = lab.zsh(&format!(
-        "source \"{}\"; printf \"%s|%s\" \"$PROJECT\" \"$ENVC_ACTIVE\"",
-        lab.zshrc().display()
-    ));
-
-    assert_eq!(out, "work|work");
+    let lab = Zsh::new(Some("/bin/zsh"));
+    lab.two_profiles();
+    lab.envc(&["init"]);
+    lab.envc(&["enable", "work"]);
+    let out = lab.sourced(r#"printf "%s|%s" "$PROJECT" "$ENVC_ACTIVE""#);
+    Checks::default().eq("a new zsh autoloads", "work|work", &out).done();
 }
 
 #[test]
 fn the_two_halves_stay_independent_in_zsh() {
-    let lab = Lab::new(Some("/bin/zsh"));
-    two_profiles(&lab);
-    lab.run(&["init"]);
-    lab.run(&["enable", "work"]);
+    let lab = Zsh::new(Some("/bin/zsh"));
+    lab.two_profiles();
+    lab.envc(&["init"]);
+    lab.envc(&["enable", "work"]);
 
-    // activate 换掉当前 zsh 里的东西，但启动选择不动。
-    let current = lab.zsh(&format!(
-        "source \"{}\"; envc activate alt >/dev/null 2>&1; printf \"%s\" \"$PROJECT\"",
-        lab.zshrc().display()
-    ));
-    assert_eq!(current, "alt");
-    assert!(
-        lab.read("startup").contains("work"),
-        "启动选择该还是 work：\n{}",
-        lab.read("startup")
+    let mut c = Checks::default();
+    c.eq(
+        "use changes the current zsh",
+        "alt",
+        &lab.sourced(r#"envc use alt >/dev/null 2>&1; printf "%s" "$PROJECT""#),
     );
-
-    // 而新开的 zsh 依然加载 work。
-    let fresh = lab.zsh(&format!(
-        "source \"{}\"; printf \"%s\" \"$PROJECT\"",
-        lab.zshrc().display()
-    ));
-    assert_eq!(fresh, "work");
+    c.has("the startup choice is still work", "work", &lab.read("startup"));
+    c.eq("a new zsh still loads work", "work", &lab.sourced(r#"printf "%s" "$PROJECT""#));
+    c.done();
 }
